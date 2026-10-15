@@ -1185,6 +1185,17 @@ async def cb_fav_del(callback: CallbackQuery):
     remove_favorite(callback.from_user.id, int(callback.data.split(":")[1]))
     await callback.answer("💔 Pleylistdan o'chirildi")
 
+@dp.message(F.document & F.caption.startswith("/setcookies"))
+async def cmd_set_cookies(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    target = COOKIES_FILE or "/data/cookies.txt"
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    tg_file = await bot.get_file(message.document.file_id)
+    await bot.download_file(tg_file.file_path, destination=target)
+    await message.answer(f"✅ Cookies saqlandi: {target}")
+    await safe_delete(message.chat.id, message.message_id)
+
 
 @dp.message(F.voice | F.video | F.video_note | F.audio)
 async def handle_media_shazam(message: Message):
