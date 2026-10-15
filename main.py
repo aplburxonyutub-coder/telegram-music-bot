@@ -1,20 +1,9 @@
 """
-Telegram musiqa boti (aiogram 3.x) — tuzatilgan to'liq versiya.
+Telegram musiqa boti (aiogram 3.x) — Ro'yxatli (1-10 + sahifalash) va Shorts/Reels Shazam versiyasi.
 
 Talablar (Python 3.10+):
     pip install -U aiogram yt-dlp python-dotenv shazamio google-genai
     Serverda ffmpeg o'rnatilgan bo'lishi kerak (mp3 konvertatsiya, effektlar va Shazam uchun).
-
-.env o'zgaruvchilari:
-    BOT_TOKEN       majburiy
-    ADMIN_ID        admin Telegram ID raqami
-    GEMINI_API_KEY  ixtiyoriy (faqat LRCLIB'da matn topilmasa zaxira sifatida ishlatiladi)
-    DB_PATH         standart: /data/music_database.db
-    COOKIES_FILE    ixtiyoriy: yt-dlp uchun cookies.txt yo'li (Instagram ko'pincha login talab qiladi)
-    HEAVY_WORKERS   bir vaqtda nechta qidiruv/yuklash bajarilsin (standart: 3)
-    DROP_PENDING    1 bo'lsa, bot o'chiq turganda yig'ilgan eski xabarlar o'tkazib yuboriladi (standart: 1)
-
-Muhim: yt-dlp ni muntazam yangilab turing (pip install -U yt-dlp).
 """
 
 import asyncio
@@ -82,21 +71,21 @@ HEAVY_WORKERS = max(1, int(os.getenv("HEAVY_WORKERS", "3") or 3))
 DROP_PENDING = os.getenv("DROP_PENDING", "1") != "0"
 
 MAX_AUDIO_DURATION_SEC = 900             # 15 daqiqadan uzun audio yuklanmaydi
-MIN_AUDIO_DURATION_SEC = 40              # juda qisqa treklar (30 soniyalik preview/jingl) tashlab yuboriladi; 0 = o'chirish
+MIN_AUDIO_DURATION_SEC = 40              # 40 soniyadan qisqa preview/demo tashlab yuboriladi
 MAX_DOWNLOAD_BYTES = 45 * 1024 * 1024    # manba fayl uchun chegara
 TELEGRAM_UPLOAD_LIMIT = 49 * 1024 * 1024
 TELEGRAM_DOWNLOAD_LIMIT = 20 * 1024 * 1024
 PLAYLIST_PAGE_SIZE = 10
+SEARCH_RESULTS_LIMIT = 30                # 3 ta sahifa (10 tadan)
 BROADCAST_DELAY_SEC = 0.05
-HEAVY_COOLDOWN_SEC = 2.0                 # bitta foydalanuvchining ketma-ket og'ir so'rovlari orasidagi tanaffus
-MAX_AUTO_TRIES = 3                       # birinchi natija xato bersa, keyingi nechta variantni sinab ko'rish
+HEAVY_COOLDOWN_SEC = 1.5                 # ketma-ket og'ir so'rovlar orasidagi tanaffus
 MAX_LYRICS_MESSAGES = 4
 FFMPEG_TIMEOUT_SEC = 180
 SUB_CACHE_TTL_SEC = 300
 
 SOCIAL_HOSTS = ("instagram.com", "tiktok.com")
 MUSIC_HOSTS = ("youtube.com", "youtu.be", "soundcloud.com")
-AUDIO_EXTS = {".mp3", ".m4a"}            # Telegram audio sifatida faqat shularni ko'rsatadi
+AUDIO_EXTS = {".mp3", ".m4a"}
 
 FFMPEG_PATH = shutil.which("ffmpeg")
 
@@ -106,12 +95,10 @@ log = logging.getLogger("musicbot")
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN topilmadi: .env fayliga BOT_TOKEN=... qatorini qo'shing.")
 
-# Katta audio fayllar sekin tarmoqda ham yuborilishi uchun so'rov timeout'i oshirilgan (standart 60 s)
 bot = Bot(token=BOT_TOKEN, session=AiohttpSession(timeout=300))
 dp = Dispatcher()
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if (genai and GEMINI_API_KEY) else None
 
-# Og'ir ishlar (yt-dlp) uchun alohida pool: oddiy DB so'rovlari ular bilan bir navbatda turib qolmasligi uchun
 HEAVY_POOL = ThreadPoolExecutor(max_workers=HEAVY_WORKERS, thread_name_prefix="heavy")
 FFMPEG_SEM = asyncio.Semaphore(2)
 
@@ -164,7 +151,7 @@ class KeyedLocks:
     """Bir xil kalit (masalan, source_id) uchun bir vaqtda faqat bitta yuklashni ta'minlaydi."""
 
     def __init__(self):
-        self._locks: dict[str, list] = {}  # kalit -> [lock, kutayotganlar soni]
+        self._locks: dict[str, list] = {}
 
     @asynccontextmanager
     async def acquire(self, key: str):
@@ -182,16 +169,14 @@ class KeyedLocks:
                 del self._locks[key]
 
 
-# Vaqtinchalik qidiruv natijalari: {search_id: {"user_id": ..., "results": [...]}} (1 soat, eng ko'pi bilan 5000 ta)
 search_cache = TTLCache(ttl=3600, max_items=5000)
-# Majburiy obunani muvaffaqiyatli o'tgan foydalanuvchilar: har safar get_chat_member chaqirmaslik uchun
 sub_ok_cache = TTLCache(ttl=SUB_CACHE_TTL_SEC, max_items=100_000)
 _last_heavy = TTLCache(ttl=120, max_items=100_000)
 _busy_users: set[int] = set()
 keyed_locks = KeyedLocks()
 
 
-# ==================== MATN YORDAMCHILARI ====================
+# ==================== MATN VA VAQT YORDAMCHILARI ====================
 _UZ_CYR_TO_LAT = {
     "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo", "ж": "j", "з": "z",
     "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
@@ -204,12 +189,19 @@ _APOS_RE = re.compile("[" + re.escape(_APOSTROPHES) + "]")
 
 
 def normalize_text(s: str) -> str:
-    """Qidiruv uchun matnni normallashtiradi: kichik harf, kirill -> lotin, apostrof variantlari olib tashlanadi."""
     s = (s or "").lower()
     s = "".join(_UZ_CYR_TO_LAT.get(ch, ch) for ch in s)
     s = _APOS_RE.sub("", s)
     s = re.sub(r"[\W_]+", " ", s)
     return s.strip()
+
+
+def format_duration(seconds: int | float | None) -> str:
+    sec = int(seconds or 0)
+    if sec <= 0:
+        return ""
+    mins, rem = divmod(sec, 60)
+    return f"{mins}:{rem:02d}"
 
 
 def text_similarity(a: str, b: str) -> float:
@@ -225,7 +217,6 @@ def text_similarity(a: str, b: str) -> float:
 
 
 def split_text(text: str, limit: int = 3600) -> list[str]:
-    """Uzun matnni qatorlar chegarasida bo'laklarga ajratadi (Telegram 4096 belgi chegarasi uchun)."""
     parts: list[str] = []
     current = ""
     for line in text.splitlines(keepends=True):
@@ -247,6 +238,18 @@ def split_text(text: str, limit: int = 3600) -> list[str]:
 def host_in(host: str, domains: tuple[str, ...]) -> bool:
     host = (host or "").lower()
     return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def is_short_video_url(url: str) -> bool:
+    """Instagram, TikTok yoki YouTube Shorts ekanini aniqlaydi."""
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    if host_in(host, SOCIAL_HOSTS):
+        return True
+    if host_in(host, ("youtube.com", "youtu.be")) and "/shorts/" in path:
+        return True
+    return False
 
 
 _URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
@@ -274,7 +277,6 @@ def safe_filename(performer: str, title: str, ext: str = "mp3") -> str:
 # ==================== MA'LUMOTLAR BAZASI ====================
 @contextmanager
 def db_conn():
-    """Har bir chaqiruv uchun alohida ulanish: muvaffaqiyatda commit, xatoda rollback, har doim close."""
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -353,7 +355,6 @@ def init_db() -> None:
             """
         )
 
-        # Eski bazalar uchun migratsiya
         ensure_column(conn, "users", "gender_prompted", "INTEGER DEFAULT 0")
         ensure_column(conn, "users", "blocked", "INTEGER DEFAULT 0")
         ensure_column(conn, "tracks", "search_text", "TEXT DEFAULT NULL")
@@ -361,7 +362,6 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fav_track ON favorites(track_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_users_active ON users(last_active_ts)")
 
-        # Qidiruv matni (kirill/lotin va apostrof variantlariga chidamli) yo'q treklar uchun to'ldiriladi
         rows = conn.execute("SELECT id, performer, title FROM tracks WHERE search_text IS NULL").fetchall()
         if rows:
             conn.executemany(
@@ -369,7 +369,6 @@ def init_db() -> None:
                 [(normalize_text(f"{r['performer'] or ''} {r['title'] or ''}"), r["id"]) for r in rows],
             )
 
-        # Bir martalik tuzatish: eski xato tufayli oshib ketgan likelarni qayta hisoblash
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         if version < 1:
             conn.execute(
@@ -416,7 +415,6 @@ def get_track_by_source(source_id: str) -> sqlite3.Row | None:
 
 
 def save_or_update_track(source_id: str, title: str, performer: str, duration: int, file_id: str, webpage_url: str) -> int:
-    """UPSERT: ikki foydalanuvchi bir vaqtda bir xil trekni so'rasa ham UNIQUE xatosi chiqmaydi."""
     search_text = normalize_text(f"{performer or ''} {title or ''}")
     with db_conn() as conn:
         conn.execute(
@@ -458,7 +456,6 @@ def remove_favorite(user_id: int, track_id: int) -> bool:
     with db_conn() as conn:
         cur = conn.execute("DELETE FROM favorites WHERE user_id = ? AND track_id = ?", (user_id, track_id))
         if cur.rowcount > 0:
-            # Layk ham kamayadi — aks holda ❤️/💔 ni takrorlab reytingni soxtalashtirish mumkin bo'lardi
             conn.execute("UPDATE tracks SET likes = MAX(likes - 1, 0) WHERE id = ?", (track_id,))
             return True
         return False
@@ -485,8 +482,7 @@ def get_top_tracks(limit: int = 10) -> list[sqlite3.Row]:
         ).fetchall()
 
 
-def search_cached_tracks(query: str, limit: int = 10) -> list[sqlite3.Row]:
-    """Keshdagi treklar ichidan qidiradi. Kirill/lotin va apostrof variantlari (o', oʻ, o‘) bir xil hisoblanadi."""
+def search_cached_tracks(query: str, limit: int = 15) -> list[sqlite3.Row]:
     tokens = normalize_text(query).split()[:6]
     if not tokens:
         return []
@@ -548,7 +544,6 @@ def mark_blocked(user_ids: list[int]) -> None:
 
 
 def make_db_backup_sync() -> str:
-    """Ishlayotgan bazaning izchil nusxasini (SQLite backup API) vaqtinchalik faylga yozadi."""
     fd, tmp_path = tempfile.mkstemp(prefix="music_db_", suffix=".db")
     os.close(fd)
     src = sqlite3.connect(DB_PATH)
@@ -578,8 +573,11 @@ class FFmpegMissing(AudioError):
     pass
 
 
-# ==================== QIDIRUV VA YUKLASH (YT-DLP + SOUNDCLOUD) ====================
-_JUNK_RE = re.compile(r"\s*[\(\[](?:official|audio|video|music|lyrics|hd|4k|karaoke).*?[\)\]]", re.IGNORECASE)
+# ==================== QIDIRUV VA YUKLASH (YOUTUBE + SOUNDCLOUD) ====================
+_JUNK_RE = re.compile(
+    r"\s*[\(\[](?:official|audio|video|music|lyrics|hd|4k|karaoke|clip|klip|prem\w*).*?[\)\]]",
+    re.IGNORECASE,
+)
 
 
 def parse_artist_title(raw_title: str, uploader: str = "") -> tuple[str, str]:
@@ -588,7 +586,8 @@ def parse_artist_title(raw_title: str, uploader: str = "") -> tuple[str, str]:
         if sep in clean:
             left, right = clean.split(sep, 1)
             return left.strip(), right.strip()
-    return (uploader or "Noma'lum ijrochi").strip(), clean or (raw_title or "")
+    clean_up = re.sub(r"\s*(?:- topic|official|music|tv|vevo)\b", "", uploader or "", flags=re.I).strip()
+    return (clean_up or "Noma'lum ijrochi").strip(), clean or (raw_title or "")
 
 
 def build_ydl_opts(**extra) -> dict:
@@ -597,8 +596,6 @@ def build_ydl_opts(**extra) -> dict:
         "no_warnings": True,
         "socket_timeout": 20,
         "retries": 3,
-        # Generic extractor o'chirilgan: faqat YouTube/SoundCloud/TikTok/Instagram kabi maxsus extractorlar ishlaydi
-        # (begona saytlarga so'rov yuborilishining oldini oladi). Eski yt-dlp versiyasida bu parametr e'tiborsiz qoladi.
         "allowed_extractors": ["default", "-generic"],
     }
     if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
@@ -639,31 +636,36 @@ def _extract_results(entries: list, prefix: str, query: str) -> list[dict]:
     return results
 
 
-def search_music_sync(query: str, max_results: int = 10) -> list[dict]:
+def search_music_sync(query: str, max_results: int = SEARCH_RESULTS_LIMIT) -> list[dict]:
+    """O'zbek va jahon musiqalari eng to'liq chiqishi uchun birinchi YouTube'dan,
+    so'ngra SoundCloud'dan qidirib, natijalarni birlashtiradi."""
     opts = build_ydl_opts(extract_flat=True, skip_download=True)
     results: list[dict] = []
+
+    # 1. YouTube qidiruvi (O'zbek xitlari va kliplari uchun eng aniq baza)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"scsearch{max_results}:{query}", download=False)
-        results = _extract_results((info or {}).get("entries") or [], "sc", query)
+            info = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
+        results.extend(_extract_results((info or {}).get("entries") or [], "yt", query))
     except Exception as ex:
-        log.warning("SoundCloud qidiruv xatosi: %s", ex)
+        log.warning("YouTube qidiruv xatosi: %s", ex)
 
-    if not results:
+    # 2. SoundCloud qidiruvi (Qo'shimcha/zaxira sifatida)
+    if len(results) < max_results:
+        need = max_results - len(results)
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f"ytsearch5:{query}", download=False)
-            results = _extract_results((info or {}).get("entries") or [], "yt", query)
+                info = ydl.extract_info(f"scsearch{need}:{query}", download=False)
+            results.extend(_extract_results((info or {}).get("entries") or [], "sc", query))
         except Exception as ex:
-            log.warning("YouTube fallback qidiruv xatosi: %s", ex)
+            log.warning("SoundCloud qidiruv xatosi: %s", ex)
 
-    return results
+    return results[:max_results]
 
 
-def download_audio_sync(url: str, outdir: str) -> tuple[str, dict, str]:
-    """Audioni `outdir` ichiga yuklaydi. Qaytaradi: (fayl yo'li, info, kengaytma: 'mp3' yoki 'm4a')."""
+def download_audio_sync(url: str, outdir: str, allow_short: bool = False) -> tuple[str, dict, str]:
+    """Audioni `outdir` ichiga yuklaydi. Qaytaradi: (fayl yo'li, info, kengaytma)."""
     opts = build_ydl_opts(
-        # ffmpeg bor bo'lsa mp3 ga o'giriladi; yo'q bo'lsa Telegram o'zi qabul qiladigan formatlar tanlanadi
         format="bestaudio/best" if FFMPEG_PATH else "bestaudio[ext=m4a]/bestaudio[ext=mp3]/best[ext=m4a]/best[ext=mp3]",
         outtmpl=os.path.join(outdir, "track.%(ext)s"),
         noplaylist=True,
@@ -713,13 +715,11 @@ def download_audio_sync(url: str, outdir: str) -> tuple[str, dict, str]:
 
 
 async def run_heavy(func, *args):
-    """Og'ir (yt-dlp) ishlarni alohida pool'da bajaradi — oddiy DB so'rovlariga xalaqit bermaydi."""
     return await asyncio.get_running_loop().run_in_executor(HEAVY_POOL, func, *args)
 
 
 @asynccontextmanager
 async def downloaded_audio(url: str):
-    """Audioni vaqtinchalik papkaga yuklaydi; blokdan chiqqach papka avtomatik o'chiriladi."""
     outdir = tempfile.mkdtemp(prefix="musicbot_")
     try:
         path, info, ext = await run_heavy(download_audio_sync, url, outdir)
@@ -730,7 +730,6 @@ async def downloaded_audio(url: str):
 
 # ==================== QO'SHIQ MATNI (LYRICS) ====================
 def fetch_lyrics_sync(performer: str, title: str) -> str | None:
-    """LRCLIB'dan matn oladi. Faqat nomi (va ijrochisi) mos kelgan natija qabul qilinadi."""
     query = urllib.parse.quote(f"{performer} {title}")
     url = f"https://lrclib.net/api/search?q={query}"
     try:
@@ -765,7 +764,6 @@ def fetch_lyrics_sync(performer: str, title: str) -> str | None:
 
 
 async def ai_lyrics(performer: str, title: str) -> str | None:
-    """Zaxira: LRCLIB'da topilmasa Gemini'dan so'raydi. Natija noto'g'ri bo'lishi mumkin — foydalanuvchiga ogohlantirish ko'rsatiladi."""
     if not gemini_client:
         return None
     try:
@@ -790,14 +788,12 @@ async def ai_lyrics(performer: str, title: str) -> str | None:
 
 # ==================== OVOZ EFFEKTLARI (FFMPEG) ====================
 EFFECT_FILTERS = {
-    # aresample=44100 boshida: manba 48 kHz bo'lsa ham sekinlashtirish aynan 0.85 bo'ladi
     "slowed": "aresample=44100,asetrate=44100*0.85,aresample=44100,aecho=0.8:0.88:60:0.4",
     "bass": "bass=g=12:f=110:w=0.6",
-    # mono manbada ham chap-o'ng harakat bo'lishi uchun avval stereo'ga o'tkaziladi
     "8d": "aformat=channel_layouts=stereo,apulsator=hz=0.125",
 }
 EFFECT_NAMES = {"slowed": "🌙 Slowed + Reverb", "bass": "🔥 Bass Boosted", "8d": "🎧 8D Audio"}
-EFFECT_SPEED = {"slowed": 0.85}  # davomiylik o'zgarishini hisoblash uchun
+EFFECT_SPEED = {"slowed": 0.85}
 
 
 async def apply_audio_effect(in_path: str, out_path: str, effect: str) -> bool:
@@ -846,9 +842,9 @@ SUB_PROMPT = "Botdan to'liq foydalanish uchun quyidagi kanallarga obuna bo'ling:
 AI_LYRICS_NOTE = "\n\n⚠️ <i>Bu matn sun'iy intellekt tomonidan yaratilgan va noto'g'ri bo'lishi mumkin.</i>"
 WELCOME_TEXT = (
     "👋 <b>Salom! Qo'shiq izlash uchun menga quyidagilardan birini yuboring:</b>\n\n"
-    "🎵 Qo'shiq yoki ijrochi nomi (masalan: <i>Hulkar - Bozor</i>)\n"
+    "🎵 Qo'shiq yoki ijrochi nomi (masalan: <i>Xamdam Sobirov - Peshta</i>)\n"
     "🎤 Ovozli xabar yoki video (Shazam orqali topish)\n"
-    "🔗 Instagram Reels, TikTok, YouTube yoki SoundCloud havolasi\n\n"
+    "🔗 Instagram Reels, TikTok, YouTube Shorts yoki YouTube/SoundCloud havolasi\n\n"
     "📂 <b>Shaxsiy pleylistingiz:</b> /my\n"
     "🔥 <b>Top musiqalar:</b> /top"
 )
@@ -876,8 +872,6 @@ def cb_chat_id(callback: CallbackQuery) -> int | None:
 
 @asynccontextmanager
 async def heavy_slot(user_id: int):
-    """Foydalanuvchiga bir vaqtda faqat bitta og'ir so'rov (qidiruv/yuklash/effekt) ruxsat beriladi.
-    Slot olinsa None, aks holda foydalanuvchiga ko'rsatiladigan xabar (str) yield qilinadi."""
     if user_id in _busy_users:
         yield "⏳ Oldingi so'rovingiz hali bajarilmoqda. Iltimos, kuting."
         return
@@ -900,7 +894,7 @@ def get_audio_caption() -> str:
     return f'🔊 <a href="https://t.me/{BOT_USERNAME}">Musiqa topish</a>'
 
 
-def get_track_keyboard(track_id: int, search_id: str | None = None) -> InlineKeyboardMarkup:
+def get_track_keyboard(track_id: int) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(text="❤️", callback_data=f"fav_add:{track_id}"),
@@ -914,17 +908,14 @@ def get_track_keyboard(track_id: int, search_id: str | None = None) -> InlineKey
             InlineKeyboardButton(text="🎧 8D", callback_data=f"fx:8d:{track_id}"),
         ],
     ]
-    if search_id:
-        rows.append([InlineKeyboardButton(text="📋 Boshqa variantlar", callback_data=f"variants:{search_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def get_gender_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="👱‍♂️ Yigit", callback_data="gender:male")],
-            [InlineKeyboardButton(text="👩 Qiz", callback_data="gender:female")],
-            [InlineKeyboardButton(text="❌", callback_data="delete_msg")],
+            [InlineKeyboardButton(text="👱‍♂️ Йигит 👱‍♂️", callback_data="gender:male")],
+            [InlineKeyboardButton(text="👩 Қиз 👩", callback_data="gender:female")],
         ]
     )
 
@@ -943,8 +934,7 @@ def build_numbered_keyboard(
     total_items: int = 0,
     page_prefix: str | None = None,
 ) -> InlineKeyboardMarkup:
-    """Raqamli tugmalar. Har bir tugma o'z callback_data'sini (masalan `play:<track_id>`) oladi —
-    shuning uchun ro'yxat o'zgarsa ham aynan o'sha trek ochiladi. Sahifalash tugmalari `{page_prefix}:{sahifa}`."""
+    """4 ustunli raqamli tugmalar + pastki qatorda [⬅️] [❌] [➡️] navigatsiya."""
     rows = []
     current_row = []
     for i, cb in enumerate(item_callbacks, start=1):
@@ -955,25 +945,22 @@ def build_numbered_keyboard(
     if current_row:
         rows.append(current_row)
 
-    if page_prefix:
-        nav_row = []
-        if page > 0:
-            nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"{page_prefix}:{page - 1}"))
-        if (page + 1) * PLAYLIST_PAGE_SIZE < total_items:
-            nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"{page_prefix}:{page + 1}"))
-        if nav_row:
-            rows.append(nav_row)
+    nav_row = []
+    if page_prefix and page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"{page_prefix}:{page - 1}"))
+    nav_row.append(InlineKeyboardButton(text="❌", callback_data="delete_msg"))
+    if page_prefix and (page + 1) * PLAYLIST_PAGE_SIZE < total_items:
+        nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"{page_prefix}:{page + 1}"))
+    rows.append(nav_row)
 
-    rows.append([InlineKeyboardButton(text="❌", callback_data="delete_msg")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def maybe_ask_gender(chat_id: int, user: sqlite3.Row) -> None:
-    """Jins so'rovi har bir foydalanuvchiga faqat bir marta beriladi."""
     if user["gender"] or user["gender_prompted"]:
         return
     await asyncio.to_thread(mark_gender_prompted, user["user_id"])
-    await bot.send_message(chat_id, "💬 Siz kimsiz?", reply_markup=get_gender_keyboard())
+    await bot.send_message(chat_id, "💬 Сен кимсан?", reply_markup=get_gender_keyboard())
 
 
 # ==================== MAJBURIY OBUNA ====================
@@ -992,16 +979,13 @@ async def check_user_subscriptions(user_id: int) -> list[sqlite3.Row]:
             ):
                 not_joined.append(ch)
         except Exception as e:
-            # Odatda bot kanalda admin emas yoki kanal ID noto'g'ri. Foydalanuvchi bloklanmaydi, lekin xato logda ko'rinadi.
-            log.warning("Obuna tekshiruvi xatosi (%s): %s — bot kanalda admin bo'lishi kerak", ch["channel_id"], e)
+            log.warning("Obuna tekshiruvi xatosi (%s): %s", ch["channel_id"], e)
     if not not_joined:
         sub_ok_cache.set(user_id, True)
     return not_joined
 
 
 class SubscriptionMiddleware(BaseMiddleware):
-    """Majburiy obunani BARCHA kirish nuqtalarida (xabar, tugma, inline) tekshiradi."""
-
     async def __call__(self, handler, event, data):
         user = getattr(event, "from_user", None)
         if user is None or user.is_bot:
@@ -1009,7 +993,7 @@ class SubscriptionMiddleware(BaseMiddleware):
 
         if isinstance(event, Message):
             if (event.text or "").startswith("/start"):
-                return await handler(event, data)  # /start o'zi obunani tekshiradi
+                return await handler(event, data)
         elif isinstance(event, CallbackQuery):
             if event.data in ("check_subs", "delete_msg"):
                 return await handler(event, data)
@@ -1061,8 +1045,7 @@ def _read_bytes(path: str) -> bytes:
         return f.read()
 
 
-async def send_cached_track(chat_id: int, source_id: str, search_id: str | None) -> bool:
-    """Trek keshda (file_id) bo'lsa darhol yuboradi. file_id yaroqsiz bo'lsa False qaytaradi — qayta yuklanadi."""
+async def send_cached_track(chat_id: int, source_id: str) -> bool:
     cached = await asyncio.to_thread(get_track_by_source, source_id)
     if not (cached and cached["file_id"]):
         return False
@@ -1072,7 +1055,7 @@ async def send_cached_track(chat_id: int, source_id: str, search_id: str | None)
             audio=cached["file_id"],
             caption=get_audio_caption(),
             parse_mode="HTML",
-            reply_markup=get_track_keyboard(cached["id"], search_id),
+            reply_markup=get_track_keyboard(cached["id"]),
         )
     except TelegramBadRequest as e:
         log.warning("Keshdagi file_id ishlamadi (%s): %s", source_id, e)
@@ -1081,8 +1064,7 @@ async def send_cached_track(chat_id: int, source_id: str, search_id: str | None)
     return True
 
 
-async def deliver_audio(chat_id: int, item: dict, path: str, info: dict, ext: str, search_id: str | None = None) -> None:
-    """Yuklangan faylni (diskdan oqim bilan, RAMga o'qimasdan) yuboradi va bazaga saqlaydi."""
+async def deliver_audio(chat_id: int, item: dict, path: str, info: dict, ext: str) -> None:
     performer, title, dur = resolve_meta(item, info)
     if os.path.getsize(path) > TELEGRAM_UPLOAD_LIMIT:
         raise AudioTooBig("Fayl hajmi Telegram chegarasidan (50 MB) katta.")
@@ -1097,79 +1079,121 @@ async def deliver_audio(chat_id: int, item: dict, path: str, info: dict, ext: st
         caption=get_audio_caption(),
         parse_mode="HTML",
     )
-    # Audio allaqachon yuborilgan: quyidagi bosqichdagi xato foydalanuvchiga "xatolik" bo'lib ko'rinmasligi kerak
     try:
         track_id = await asyncio.to_thread(
             save_or_update_track, item["source_id"], title, performer, dur, sent.audio.file_id, item["url"]
         )
-        await sent.edit_reply_markup(reply_markup=get_track_keyboard(track_id, search_id))
+        await sent.edit_reply_markup(reply_markup=get_track_keyboard(track_id))
     except Exception:
         log.exception("Trekni saqlash/tugma qo'yishda xato: %s", item["source_id"])
 
 
-async def send_track_to_user(chat_id: int, item: dict, search_id: str | None = None) -> None:
+async def send_track_to_user(chat_id: int, item: dict) -> None:
     source_id = item["source_id"]
-    if await send_cached_track(chat_id, source_id, search_id):
+    if await send_cached_track(chat_id, source_id):
         return
 
-    # Bir xil trekni bir vaqtda ikki marta yuklamaslik: ikkinchi foydalanuvchi birinchisini kutib, keshdan oladi
     async with keyed_locks.acquire(source_id):
-        if await send_cached_track(chat_id, source_id, search_id):
+        if await send_cached_track(chat_id, source_id):
             return
         wait_msg = await bot.send_message(chat_id, "⏳ Yuklanmoqda...")
         try:
             async with downloaded_audio(item["url"]) as (path, info, ext):
-                await deliver_audio(chat_id, item, path, info, ext, search_id)
+                await deliver_audio(chat_id, item, path, info, ext)
         finally:
             await safe_delete(chat_id, wait_msg.message_id)
 
 
+# ==================== RO'YXATLI QIDIRUV VA SAHIFALASH ====================
+async def render_search_results(
+    chat_id: int,
+    search_id: str,
+    page: int = 0,
+    edit_message_id: int | None = None,
+) -> None:
+    entry = search_cache.get(search_id)
+    if not entry:
+        txt = "⏳ Qidiruv natijalari eskirgan. Iltimos, qo'shiq nomini qaytadan yozing."
+        if edit_message_id:
+            try:
+                await bot.edit_message_text(txt, chat_id=chat_id, message_id=edit_message_id)
+            except TelegramBadRequest:
+                pass
+        else:
+            await bot.send_message(chat_id, txt)
+        return
+
+    results = entry["results"]
+    query = entry.get("query", "Qidiruv")
+    total = len(results)
+    last_page = max(0, (total - 1) // PLAYLIST_PAGE_SIZE)
+    page = max(0, min(page, last_page))
+
+    start = page * PLAYLIST_PAGE_SIZE
+    chunk = results[start : start + PLAYLIST_PAGE_SIZE]
+    end = start + len(chunk)
+
+    lines = [
+        f"🔎 <b>{html.escape(query)}</b>",
+        f"<b>Natijalar {start + 1}-{end} / {total}</b>\n",
+    ]
+    for idx, item in enumerate(chunk, start=1):
+        dur_str = format_duration(item.get("duration"))
+        dur_part = f" <i>{dur_str}</i>" if dur_str else ""
+        lines.append(f"{idx}. {html.escape(item['performer'] or '')} — {html.escape(item['title'] or '')}{dur_part}")
+
+    callbacks = [f"sr:{search_id}:{start + i}" for i in range(len(chunk))]
+    kb = build_numbered_keyboard(
+        callbacks,
+        page=page,
+        total_items=total,
+        page_prefix=f"sr_pg:{search_id}",
+    )
+    text = "\n".join(lines)
+
+    if edit_message_id:
+        try:
+            await bot.edit_message_text(
+                text, chat_id=chat_id, message_id=edit_message_id, parse_mode="HTML", reply_markup=kb
+            )
+        except TelegramBadRequest:
+            pass
+    else:
+        await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+
+
 async def process_music_query(message: Message, query: str) -> None:
-    """Qidiradi va birinchi natijani yuboradi (xato bo'lsa keyingi variantga o'tadi).
-    Chaqiruvchi `heavy_slot` ni egallagan bo'lishi kerak."""
+    """Qidiruv natijalarini 10 tadan ro'yxat qilib chiqaradi."""
     user_id = message.from_user.id
     chat_id = message.chat.id
     user = await asyncio.to_thread(register_or_touch_user, user_id, True)
     await chat_action(chat_id, "typing")
 
+    wait_msg = await message.answer("🔎 Qidirilmoqda...")
     try:
-        results = await run_heavy(search_music_sync, query, 10)
+        results = await run_heavy(search_music_sync, query, SEARCH_RESULTS_LIMIT)
     except Exception:
         log.exception("Qidiruvda xato: %s", query)
         results = []
+    finally:
+        await safe_delete(chat_id, wait_msg.message_id)
+
     if not results:
         await message.answer("😔 Hech narsa topilmadi. Qo'shiq yoki xonanda nomini boshqacharoq yozib ko'ring.")
         return
 
     search_id = secrets.token_hex(4)
-    search_cache.set(search_id, {"user_id": user_id, "results": results})
-    variants_id = search_id if len(results) > 1 else None
+    search_cache.set(search_id, {"user_id": user_id, "results": results, "query": query})
 
-    sent = False
-    for item in results[:MAX_AUTO_TRIES]:
-        try:
-            await send_track_to_user(chat_id, item, variants_id)
-            sent = True
-            break
-        except AudioError as e:
-            log.info("Variant o'tkazib yuborildi (%s): %s", item["source_id"], e)
-        except Exception:
-            log.exception("Trek yuborishda xato: %s", item["source_id"])
-    if not sent:
-        await message.answer("⚠️ Ushbu trekni yuklashda xatolik bo'ldi. Boshqa nom bilan qidirib ko'ring.")
-        return
-
+    await render_search_results(chat_id, search_id, page=0)
     await maybe_ask_gender(chat_id, user)
 
 
-async def process_social_link(message: Message, item: dict) -> None:
-    """Instagram/TikTok: videodagi musiqani Shazam bilan aniqlab, to'liq trekni yuboradi.
-    Aniqlanmasa — videodagi audioning o'zini yuboradi."""
+async def process_short_video_link(message: Message, item: dict) -> None:
+    """Instagram Reels, TikTok va YouTube Shorts: videodagi musiqani Shazam orqali
+    aniqlab, 10 talik variantlar ro'yxatini chiqaradi. Topilmasa — videodagi audioni yuboradi."""
     chat_id = message.chat.id
-    if await send_cached_track(chat_id, item["source_id"], None):
-        return
-
-    wait_msg = await message.answer("🎧 Havoladagi musiqa aniqlanmoqda...")
+    wait_msg = await message.answer("🎧 Videodagi musiqa aniqlanmoqda (Shazam)...")
     found = None
     try:
         async with downloaded_audio(item["url"]) as (path, info, ext):
@@ -1177,8 +1201,11 @@ async def process_social_link(message: Message, item: dict) -> None:
                 audio_bytes = await asyncio.to_thread(_read_bytes, path)
                 found = await recognize_with_shazam(audio_bytes)
             if not found:
+                # Shazam topa olmasa, videoning o'z ovozini yuboramiz
                 await deliver_audio(chat_id, item, path, info, ext)
-                await message.answer("ℹ️ Musiqani aniqlab bo'lmadi, videodagi audio yuborildi.")
+                await message.answer(
+                    "ℹ️ Videodagi musiqani Shazam orqali aniqlab bo'lmadi, shuning uchun videodagi asl audio yuborildi."
+                )
     finally:
         await safe_delete(chat_id, wait_msg.message_id)
 
@@ -1188,33 +1215,31 @@ async def process_social_link(message: Message, item: dict) -> None:
 
 
 async def process_link(message: Message, url: str) -> None:
-    """Havola bilan ishlash. Chaqiruvchi `heavy_slot` ni egallagan bo'lishi kerak."""
+    """Havolani tahlil qiladi: Shorts/Reels/TikTok bo'lsa Shazam+Ro'yxat, to'liq YouTube/SoundCloud bo'lsa to'g'ridan-to'g'ri MP3."""
     chat_id = message.chat.id
     host = (urllib.parse.urlparse(url).hostname or "").lower()
-    is_social = host_in(host, SOCIAL_HOSTS)
-    is_music = host_in(host, MUSIC_HOSTS)
-    if not (is_social or is_music):
+    is_supported = host_in(host, SOCIAL_HOSTS) or host_in(host, MUSIC_HOSTS)
+    if not is_supported:
         await message.answer("⚠️ Faqat Instagram, TikTok, YouTube va SoundCloud havolalari qo'llab-quvvatlanadi.")
         return
 
-    # Qidiruv hisobi: musiqa havolasi bevosita hisoblanadi; ijtimoiy tarmoq havolasi — Shazam topgach process_music_query ichida
-    user = await asyncio.to_thread(register_or_touch_user, message.from_user.id, is_music)
+    is_short = is_short_video_url(url)
+    user = await asyncio.to_thread(register_or_touch_user, message.from_user.id, not is_short)
     source_id = "url_" + hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
     item = {"source_id": source_id, "title": None, "performer": None, "duration": 0, "url": url}
 
     try:
-        if is_music:
+        if is_short:
+            await process_short_video_link(message, item)
+        else:
             await send_track_to_user(chat_id, item)
             await maybe_ask_gender(chat_id, user)
-        else:
-            await process_social_link(message, item)
     except AudioError as e:
         await message.answer(f"⚠️ {e}")
     except Exception:
         log.exception("Havolani qayta ishlashda xato: %s", url)
         await message.answer(
-            "⚠️ Havoladan audio olib bo'lmadi. Havola ochiq (public) ekanini tekshiring "
-            "(Instagram ko'pincha login talab qiladi)."
+            "⚠️ Havoladan audio olib bo'lmadi. Havola ochiq (public) ekanini tekshiring."
         )
 
 
@@ -1243,7 +1268,7 @@ async def handle_gender(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "check_subs")
 async def cb_check_subs(callback: CallbackQuery):
-    sub_ok_cache.pop(callback.from_user.id)  # yangi natija olish uchun keshni chetlab o'tamiz
+    sub_ok_cache.pop(callback.from_user.id)
     not_joined = await check_user_subscriptions(callback.from_user.id)
     if not_joined:
         return await callback.answer("❌ Hali barcha kanallarga a'zo bo'lmadingiz!", show_alert=True)
@@ -1293,8 +1318,8 @@ async def render_playlist_page(chat_id: int, user_id: int, page: int = 0, edit_m
             await bot.edit_message_text(
                 text, chat_id=chat_id, message_id=edit_message_id, parse_mode="HTML", reply_markup=kb
             )
-        except TelegramBadRequest as e:
-            log.debug("Pleylistni tahrirlab bo'lmadi: %s", e)  # masalan, "message is not modified"
+        except TelegramBadRequest:
+            pass
     else:
         await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
 
@@ -1323,7 +1348,6 @@ async def cb_playlist_page(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("play:"))
 async def cb_play_track(callback: CallbackQuery):
-    """/my va /top dagi raqamli tugmalar: callback ichida indeks emas, aynan track_id turadi."""
     try:
         track_id = int(callback.data.split(":")[1])
     except ValueError:
@@ -1396,7 +1420,7 @@ async def cb_lyrics(callback: CallbackQuery):
         if lyrics:
             await asyncio.to_thread(save_lyrics, track_id, lyrics)
     if not lyrics:
-        lyrics = await ai_lyrics(performer, title)  # saqlanmaydi: AI matni ishonchsiz bo'lishi mumkin
+        lyrics = await ai_lyrics(performer, title)
         ai_generated = bool(lyrics)
 
     if not lyrics:
@@ -1468,7 +1492,7 @@ async def cb_audio_effect(callback: CallbackQuery):
                 duration=dur if dur > 0 else None,
                 caption=get_audio_caption(),
                 parse_mode="HTML",
-                reply_markup=CLOSE_KB,
+                reply_markup=get_track_keyboard(tr["id"]),
             )
             await safe_delete(chat_id, wait_msg.message_id)
         except Exception:
@@ -1481,7 +1505,7 @@ async def cb_audio_effect(callback: CallbackQuery):
             await asyncio.to_thread(shutil.rmtree, tmpdir, True)
 
 
-# ==================== SHAZAM (OVOZ / VIDEO) ====================
+# ==================== SHAZAM (OVOZ / VIDEO / DUMALOQ VIDEO) ====================
 @dp.message(F.voice | F.video | F.video_note | F.audio)
 async def handle_media_shazam(message: Message):
     media = message.voice or message.video or message.video_note or message.audio
@@ -1530,25 +1554,29 @@ async def handle_text_search(message: Message):
             await process_music_query(message, text)
 
 
-@dp.callback_query(F.data.startswith("variants:"))
-async def cb_show_variants(callback: CallbackQuery):
-    search_id = callback.data.split(":", 1)[1]
-    entry = search_cache.get(search_id)
-    chat_id = cb_chat_id(callback)
-    if not entry or chat_id is None:
-        return await callback.answer("Qaytadan qidiruv bering", show_alert=True)
+@dp.callback_query(F.data.startswith("sr_pg:"))
+async def cb_search_page(callback: CallbackQuery):
+    """Qidiruv natijalari sahifalarini (⬅️ ➡️) varaqlash."""
+    if callback.message is None:
+        return await callback.answer()
+    try:
+        _, search_id, page_str = callback.data.split(":")
+        page = int(page_str)
+    except ValueError:
+        return await callback.answer()
 
     await callback.answer()
-    results = entry["results"][:10]
-    lines = ["🔎 <b>Topilgan variantlar:</b>\n"]
-    for idx, item in enumerate(results, start=1):
-        lines.append(f"{idx}. {html.escape(item['performer'])} — {html.escape(item['title'])}")
-    kb = build_numbered_keyboard([f"sr:{search_id}:{i}" for i in range(len(results))])
-    await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML", reply_markup=kb)
+    await render_search_results(
+        callback.message.chat.id,
+        search_id,
+        page=page,
+        edit_message_id=callback.message.message_id,
+    )
 
 
 @dp.callback_query(F.data.startswith("sr:"))
 async def cb_search_play(callback: CallbackQuery):
+    """1 dan 10 gacha bo'lgan raqamli tugmalardan biri bosilganda shu musiqani yuklab beradi."""
     try:
         _, search_id, idx_str = callback.data.split(":")
         idx = int(idx_str)
@@ -1557,19 +1585,19 @@ async def cb_search_play(callback: CallbackQuery):
     entry = search_cache.get(search_id)
     chat_id = cb_chat_id(callback)
     if not entry or chat_id is None or not (0 <= idx < len(entry["results"])):
-        return await callback.answer("Qaytadan qidiruv bering", show_alert=True)
+        return await callback.answer("⏳ Qidiruv eskirgan, qaytadan yozing", show_alert=True)
 
     async with heavy_slot(callback.from_user.id) as refusal:
         if refusal:
             return await callback.answer(refusal, show_alert=True)
-        await callback.answer()
+        await callback.answer("⏳ Yuklanmoqda...")
         try:
             await send_track_to_user(chat_id, entry["results"][idx])
         except AudioError as e:
             await bot.send_message(chat_id, f"⚠️ {e}")
         except Exception:
             log.exception("Variantni yuklashda xato")
-            await bot.send_message(chat_id, "⚠️ Yuklashda xatolik yuz berdi.")
+            await bot.send_message(chat_id, "⚠️ Ushbu variantni yuklab bo'lmadi. Ro'yxatdan boshqa raqamni tanlab ko'ring.")
 
 
 # ==================== INLINE REJIM (@bot_nomi qo'shiq) ====================
@@ -1592,7 +1620,6 @@ async def handle_inline_query(inline_query: InlineQuery):
                     parse_mode="HTML",
                 )
             )
-    # Natijalar foydalanuvchiga bog'liq emas, shuning uchun is_personal=False va uzoqroq kesh
     await inline_query.answer(results, cache_time=30, is_personal=False)
 
 
@@ -1629,7 +1656,6 @@ async def cmd_add_channel(message: Message, command: CommandObject):
         return await message.answer("⚠️ 3 ta qismni | belgisi bilan ajratib yozing.")
     ch_id, title, link = parts[0], parts[1], parts[2]
 
-    # Bot kanalda admin bo'lmasa obuna tekshiruvi ishlamaydi — buni darhol ogohlantiramiz
     warn = ""
     try:
         me_member = await bot.get_chat_member(ch_id, BOT_ID)
@@ -1692,12 +1718,11 @@ async def cmd_broadcast(message: Message, command: CommandObject):
             try:
                 await send_one(uid)
             except TelegramRetryAfter as e:
-                # Telegram tezlik chegarasi: aytilgan vaqt kutiladi va bir marta qayta uriniladi
                 await asyncio.sleep(e.retry_after + 1)
                 await send_one(uid)
             sent += 1
         except TelegramForbiddenError:
-            blocked_now.append(uid)  # foydalanuvchi botni bloklagan
+            blocked_now.append(uid)
             failed += 1
         except Exception:
             failed += 1
@@ -1708,7 +1733,7 @@ async def cmd_broadcast(message: Message, command: CommandObject):
                 pass
         await asyncio.sleep(BROADCAST_DELAY_SEC)
 
-    await asyncio.to_thread(mark_blocked, blocked_now)  # keyingi broadcastlarda ularga yuborilmaydi
+    await asyncio.to_thread(mark_blocked, blocked_now)
     await status.edit_text(f"✅ Yakunlandi! Yuborildi: {sent}, Xato: {failed} (bloklaganlar: {len(blocked_now)})")
 
 
@@ -1718,7 +1743,6 @@ async def cmd_getdb(message: Message):
         return
     if not os.path.exists(DB_PATH):
         return await message.answer("Baza fayli topilmadi.")
-    # WAL rejimida faylni oddiy nusxalash yetarli emas — SQLite backup API ishlatiladi
     tmp_path = await asyncio.to_thread(make_db_backup_sync)
     try:
         if os.path.getsize(tmp_path) > TELEGRAM_UPLOAD_LIMIT:
@@ -1736,7 +1760,6 @@ async def cmd_getdb(message: Message):
 async def main():
     global BOT_USERNAME, BOT_ID
     init_db()
-    # Oddiy to_thread chaqiruvlari (DB, lyrics) uchun yetarli kattalikdagi pool; og'ir ishlar HEAVY_POOL'da
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=16, thread_name_prefix="default"))
 
     me = await bot.get_me()
@@ -1754,7 +1777,6 @@ async def main():
             BotCommand(command="top", description="🔥 Top musiqalar"),
         ]
     )
-    # Bot o'chiq turganda yig'ilgan eski so'rovlar qayta yoqilganda birdan yuklashga tushmasligi uchun
     await bot.delete_webhook(drop_pending_updates=DROP_PENDING)
     try:
         await dp.start_polling(bot)
