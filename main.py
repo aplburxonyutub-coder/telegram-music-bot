@@ -1,11 +1,10 @@
 """
-Telegram musiqa boti (aiogram 3.x) — To'liq Tuzatilgan Yakuniy Versiya.
+Telegram musiqa boti (aiogram 3.x) — Railway uchun to'liq moslashtirilgan versiya.
 - 10 talik ro'yxat va sahifalash (⬅️ ❌ ➡️)
-- YouTube Shorts / Reels / TikTok / Voice -> FFmpeg WAV -> Shazam -> 10 talik variantlar
-- YouTube (Flat Search + Anti-Bot) + SoundCloud qidiruv va Avto-Fallback zanjiri
+- YouTube Shorts / Reels / TikTok / Voice -> FFmpeg (Loudnorm) -> Shazam -> 10 talik variantlar
+- SoundCloud (Asosiy, bloklanmaydigan) + YouTube qidiruv va Avto-Fallback zanjiri
 - Slowed, Bass, 8D audio effektlar (FFmpeg)
-- Qo'shiq matni (LRCLIB + Gemini AI), Pleylist (/my), Top (/top)
-- Admin panel va statistika (/stat, /channels, /addch, /delch, /broadcast, /setcookies)
+- Qo'shiq matni (LRCLIB + Gemini AI), Pleylist (/my), Top (/top), Statistika (/stat)
 """
 
 import asyncio
@@ -70,8 +69,7 @@ HEAVY_WORKERS = max(1, int(os.getenv("HEAVY_WORKERS", "4") or 4))
 DROP_PENDING = os.getenv("DROP_PENDING", "1") != "0"
 
 MAX_AUDIO_DURATION_SEC = 900
-MIN_AUDIO_DURATION_SEC = 30
-MAX_DOWNLOAD_BYTES = 48 * 1024 * 1024
+MIN_AUDIO_DURATION_SEC = 35
 TELEGRAM_UPLOAD_LIMIT = 49 * 1024 * 1024
 PLAYLIST_PAGE_SIZE = 10
 SEARCH_RESULTS_LIMIT = 30
@@ -83,7 +81,6 @@ SUB_CACHE_TTL_SEC = 300
 
 SOCIAL_HOSTS = ("instagram.com", "tiktok.com", "vt.tiktok.com", "vm.tiktok.com")
 MUSIC_HOSTS = ("youtube.com", "youtu.be", "music.youtube.com", "soundcloud.com", "on.soundcloud.com")
-AUDIO_EXTS = {".mp3", ".m4a", ".ogg", ".opus", ".webm", ".wav", ".aac", ".flac"}
 
 FFMPEG_PATH = shutil.which("ffmpeg")
 FFPROBE_PATH = shutil.which("ffprobe")
@@ -189,6 +186,12 @@ def normalize_text(s: str) -> str:
     s = _APOS_RE.sub("", s)
     s = re.sub(r"[\W_]+", " ", s)
     return s.strip()
+
+
+def clean_search_query(q: str) -> str:
+    """Shazam qaytargan uzun (feat. ...) qo'shimchalarni tozalab, qidiruvni aniqlashtiradi."""
+    q = re.sub(r"\s*[\(\[](?:feat\.?|ft\.?|with|prod\.?).*?[\)\]]", "", q, flags=re.I)
+    return q.strip()
 
 
 def format_duration(seconds: int | float | None) -> str:
@@ -509,7 +512,7 @@ class AudioTooBig(AudioError):
     pass
 
 
-# ==================== QIDIRUV VA YUKLASH (YOUTUBE + COOKIES + SOUNDCLOUD) ====================
+# ==================== QIDIRUV VA YUKLASH (SOUNDCLOUD + YOUTUBE) ====================
 _JUNK_RE = re.compile(
     r"\s*[\(\[](?:official|audio|video|music|lyrics|hd|4k|karaoke|clip|klip|prem\w*).*?[\)\]]",
     re.IGNORECASE,
@@ -526,44 +529,67 @@ def parse_artist_title(raw_title: str, uploader: str = "") -> tuple[str, str]:
     return (clean_up or "Ijrochi").strip(), clean or (raw_title or "Qo'shiq")
 
 
-def build_ydl_opts(**extra) -> dict:
+def build_ydl_opts(use_cookies: bool = True, **extra) -> dict:
+    # MUHIM: Global User-Agent berilmaydi, aks holda YouTube/SoundCloud mobil clientlari buziladi!
     opts = {
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 20,
-        "retries": 3,
+        "retries": 2,
         "geo_bypass": True,
         "nocheckcertificate": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["tv", "ios", "android", "web"],
-            }
-        },
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            )
-        },
     }
-    if COOKIES_FILE and os.path.isfile(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0:
+    if use_cookies and COOKIES_FILE and os.path.isfile(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0:
         opts["cookiefile"] = COOKIES_FILE
     opts.update(extra)
     return opts
 
 
-def search_music_sync(query: str, max_results: int = SEARCH_RESULTS_LIMIT) -> list[dict]:
-    # MUHIM: extract_flat="in_playlist" YouTube bot-blokirovkasini oldini oladi va 10 barobar tez ishlaydi!
-    opts = build_ydl_opts(extract_flat="in_playlist", skip_download=True)
+def _extract_sc_results(query: str, limit: int, seen: set) -> list[dict]:
+    """SoundCloud qidiruvi — Railway'da bloklanmaydi va juda tez ishlaydi."""
     results: list[dict] = []
-    seen: set = set()
-
-    # 1. YouTube qidiruvi
+    sc_opts = build_ydl_opts(use_cookies=False, extract_flat=True, skip_download=True)
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
-            entries = (info or {}).get("entries", []) if info else []
-            for e in entries:
+        with yt_dlp.YoutubeDL(sc_opts) as ydl:
+            info = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
+            for e in ((info or {}).get("entries") or []):
+                if not e:
+                    continue
+                url = e.get("url") or e.get("webpage_url")
+                if not url:
+                    continue
+                eid = str(e.get("id") or hashlib.md5(url.encode()).hexdigest()[:10])
+                if eid in seen or url in seen:
+                    continue
+                dur = int(e.get("duration") or 0)
+                # 30 soniyalik SoundCloud Go+ (DRM preview) treklarni avtomatik filtrlaymiz
+                if dur and (dur > MAX_AUDIO_DURATION_SEC or dur < MIN_AUDIO_DURATION_SEC or (29 <= dur <= 31)):
+                    continue
+                artist, title = parse_artist_title(e.get("title") or query, e.get("uploader") or "")
+                seen.add(eid)
+                seen.add(url)
+                results.append(
+                    {
+                        "source_id": f"sc_{eid}",
+                        "title": title,
+                        "performer": artist,
+                        "duration": dur,
+                        "url": url,
+                    }
+                )
+    except Exception as ex:
+        log.warning("SoundCloud qidiruv xatosi: %s", ex)
+    return results
+
+
+def _extract_yt_results(query: str, limit: int, seen: set) -> list[dict]:
+    """YouTube qidiruvi — qo'shimcha natijalar uchun."""
+    results: list[dict] = []
+    yt_opts = build_ydl_opts(extract_flat="in_playlist", skip_download=True)
+    try:
+        with yt_dlp.YoutubeDL(yt_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+            for e in ((info or {}).get("entries") or []):
                 if not e:
                     continue
                 eid = e.get("id")
@@ -572,9 +598,7 @@ def search_music_sync(query: str, max_results: int = SEARCH_RESULTS_LIMIT) -> li
                 dur = int(e.get("duration") or 0)
                 if dur and (dur > MAX_AUDIO_DURATION_SEC or dur < MIN_AUDIO_DURATION_SEC):
                     continue
-                url = e.get("url") or f"https://www.youtube.com/watch?v={eid}"
-                if not url.startswith("http"):
-                    url = f"https://www.youtube.com/watch?v={eid}"
+                url = f"https://www.youtube.com/watch?v={eid}"
                 artist, title = parse_artist_title(
                     e.get("title") or query, e.get("uploader") or e.get("channel") or ""
                 )
@@ -590,54 +614,41 @@ def search_music_sync(query: str, max_results: int = SEARCH_RESULTS_LIMIT) -> li
                 )
     except Exception as ex:
         log.warning("YouTube qidiruv xatosi: %s", ex)
+    return results
 
-    # 2. SoundCloud qidiruvi (zaxira yoki to'ldiruvchi sifatida)
+
+def search_music_sync(query: str, max_results: int = SEARCH_RESULTS_LIMIT) -> list[dict]:
+    seen: set = set()
+    cleaned = clean_search_query(query) or query
+
+    # 1. Birinchi navbatda SoundCloud'dan qidiramiz (Railway'da 100% bloklanmaydi)
+    results = _extract_sc_results(cleaned, max_results, seen)
+
+    # Agar tozalangan so'rov bo'yicha kam chiqsa va u asl so'rovdan farq qilsa
+    if len(results) < 5 and cleaned != query:
+        results.extend(_extract_sc_results(query, max_results - len(results), seen))
+
+    # 2. Ro'yxatni to'ldirish uchun YouTube natijalarini qo'shamiz
     if len(results) < max_results:
         need = max_results - len(results)
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f"scsearch{need}:{query}", download=False)
-                for e in ((info or {}).get("entries") or []):
-                    if not e:
-                        continue
-                    eid = str(e.get("id") or "")
-                    url = e.get("url") or e.get("webpage_url")
-                    if not url or eid in seen:
-                        continue
-                    dur = int(e.get("duration") or 0)
-                    if dur and (dur > MAX_AUDIO_DURATION_SEC or dur < MIN_AUDIO_DURATION_SEC):
-                        continue
-                    artist, title = parse_artist_title(e.get("title") or query, e.get("uploader") or "")
-                    seen.add(eid or url)
-                    results.append(
-                        {
-                            "source_id": f"sc_{eid or hashlib.md5(url.encode()).hexdigest()[:10]}",
-                            "title": title,
-                            "performer": artist,
-                            "duration": dur,
-                            "url": url,
-                        }
-                    )
-        except Exception as ex:
-            log.warning("SoundCloud qidiruv xatosi: %s", ex)
+        results.extend(_extract_yt_results(cleaned, need, seen))
 
     return results[:max_results]
 
 
-def download_media_sync(url: str, outdir: str, is_short: bool = False) -> tuple[str, dict, str]:
-    fmt = (
-        "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best"
-        if not is_short
-        else "bestaudio/best[filesize<40M]/best"
-    )
+def _try_download_once(url: str, outdir: str, is_short: bool, use_cookies: bool, client_list: list[str] | None = None) -> tuple[str, dict, str]:
+    extra: dict = {}
+    if client_list:
+        extra["extractor_args"] = {"youtube": {"player_client": client_list}}
+
     opts = build_ydl_opts(
-        format=fmt,
+        use_cookies=use_cookies,
+        format="bestaudio/best",
         outtmpl=os.path.join(outdir, "media.%(ext)s"),
         noplaylist=True,
         playlistend=1,
-        max_filesize=MAX_DOWNLOAD_BYTES,
+        **extra,
     )
-    # ffprobe va ffmpeg ikkalasi ham bo'lsagina yt-dlp postprocessor ishlatamiz
     if FFMPEG_PATH and FFPROBE_PATH and not is_short:
         opts["postprocessors"] = [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
@@ -657,15 +668,41 @@ def download_media_sync(url: str, outdir: str, is_short: bool = False) -> tuple[
         if os.path.isfile(os.path.join(outdir, f)) and not f.endswith(".part")
     ]
     if not files:
-        raise AudioError("Media faylni yuklab bo'lmadi.")
+        raise AudioError("Media fayl topilmadi.")
 
     path = max(files, key=os.path.getsize)
     ext = os.path.splitext(path)[1].lstrip(".").lower()
     return path, info, ext
 
 
+def download_media_sync(url: str, outdir: str, is_short: bool = False) -> tuple[str, dict, str]:
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    is_yt = host_in(host, ("youtube.com", "youtu.be", "music.youtube.com"))
+
+    if not is_yt:
+        return _try_download_once(url, outdir, is_short=is_short, use_cookies=True)
+
+    # YouTube uchun bir nechta usulni ketma-ket sinab ko'ramiz
+    attempts = [
+        (False, ["android_vr", "ios", "mweb"]),
+        (True, None),
+        (False, ["ios", "android", "web"]),
+    ]
+    last_err = None
+    for use_cookies, clients in attempts:
+        try:
+            for f in os.listdir(outdir):
+                try:
+                    os.remove(os.path.join(outdir, f))
+                except OSError:
+                    pass
+            return _try_download_once(url, outdir, is_short=is_short, use_cookies=use_cookies, client_list=clients)
+        except Exception as e:
+            last_err = e
+    raise last_err or AudioError("YouTube orqali yuklab bo'lmadi.")
+
+
 async def ensure_mp3_or_m4a(path: str, ext: str) -> tuple[str, str]:
-    """Agar yuklangan fayl .webm, .ogg yoki .mp4 bo'lsa, FFmpeg yordamida .mp3 ga o'giradi."""
     if ext in ("mp3", "m4a"):
         return path, ext
     if not FFMPEG_PATH:
@@ -782,8 +819,8 @@ async def ai_lyrics(performer: str, title: str) -> str | None:
     return text
 
 
-async def prepare_wav_for_shazam(raw_bytes: bytes, start_sec: int = 0, duration_sec: int = 12) -> bytes:
-    """Har qanday video/voice/audio faylni Shazam bexato o'qishi uchun 16kHz Mono WAV ga o'giradi."""
+async def prepare_wav_for_shazam(raw_bytes: bytes, start_sec: int = 0, duration_sec: int = 14, boost_audio: bool = False) -> bytes:
+    """Faylni Shazam uchun 44.1kHz WAV formatga o'tkazadi. boost_audio=True bo'lsa, past ovozli yozuvlarni kuchaytiradi."""
     if not FFMPEG_PATH:
         return raw_bytes
     with tempfile.TemporaryDirectory(prefix="shz_") as tmpdir:
@@ -795,11 +832,15 @@ async def prepare_wav_for_shazam(raw_bytes: bytes, start_sec: int = 0, duration_
         cmd = [FFMPEG_PATH, "-y"]
         if start_sec > 0:
             cmd += ["-ss", str(start_sec)]
-        cmd += [
-            "-i", in_p,
-            "-t", str(duration_sec),
-            "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", out_p,
-        ]
+        cmd += ["-i", in_p, "-t", str(duration_sec), "-vn"]
+        if boost_audio:
+            cmd += [
+                "-af",
+                "silenceremove=start_periods=1:start_silence=0.1:start_threshold=-45dB,"
+                "highpass=f=80,lowpass=f=12000,dynaudnorm=f=100:g=15",
+            ]
+        cmd += ["-ac", "1", "-ar", "44100", "-f", "wav", out_p]
+
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.DEVNULL,
@@ -821,10 +862,15 @@ async def recognize_with_shazam(media_bytes: bytes) -> str | None:
     if Shazam is None:
         return None
     shazam = Shazam()
-    # Videoning boshidan (0s) va o'rtarog'idan (5s) sinab ko'ramiz
-    for offset in (0, 5):
+    # 1) Toza WAV, 2) Jimlik qirqilgan va ovozi kuchaytirilgan WAV (voice uchun), 3) 4-sekunddan keyingi qism
+    profiles = [
+        (0, 14, False),
+        (0, 15, True),
+        (4, 14, True),
+    ]
+    for offset, dur, boost in profiles:
         try:
-            wav_bytes = await prepare_wav_for_shazam(media_bytes, start_sec=offset, duration_sec=12)
+            wav_bytes = await prepare_wav_for_shazam(media_bytes, start_sec=offset, duration_sec=dur, boost_audio=boost)
             out = await asyncio.wait_for(shazam.recognize(wav_bytes), timeout=25)
             track = (out or {}).get("track")
             if track:
@@ -833,7 +879,7 @@ async def recognize_with_shazam(media_bytes: bytes) -> str | None:
                 if title or subtitle:
                     return f"{subtitle} - {title}".strip(" -")
         except Exception as e:
-            log.warning("Shazam xatosi (offset=%s): %s", offset, e)
+            log.warning("Shazam xatosi (offset=%s, boost=%s): %s", offset, boost, e)
     return None
 
 
@@ -1036,7 +1082,7 @@ async def send_cached_track(chat_id: int, source_id: str) -> bool:
     return True
 
 
-async def deliver_audio(chat_id: int, item: dict, path: str, info: dict, ext: str) -> None:
+async def deliver_audio(chat_id: int, item: dict, path: str, info: dict, ext: str, alias_source_id: str | None = None) -> None:
     performer, title, dur = resolve_meta(item, info)
     if os.path.getsize(path) > TELEGRAM_UPLOAD_LIMIT:
         raise AudioTooBig("Fayl hajmi 50 MB dan katta.")
@@ -1054,6 +1100,10 @@ async def deliver_audio(chat_id: int, item: dict, path: str, info: dict, ext: st
     track_id = await asyncio.to_thread(
         save_or_update_track, item["source_id"], title, performer, dur, sent.audio.file_id, item["url"]
     )
+    if alias_source_id and alias_source_id != item["source_id"]:
+        await asyncio.to_thread(
+            save_or_update_track, alias_source_id, title, performer, dur, sent.audio.file_id, item["url"]
+        )
     await sent.edit_reply_markup(reply_markup=get_track_keyboard(track_id))
 
 
@@ -1073,17 +1123,30 @@ async def send_track_to_user(chat_id: int, item: dict, fallback_candidates: list
                     return
             except Exception as primary_err:
                 log.warning("Asosiy variant yuklanmadi (%s): %s", item["url"], primary_err)
-                # Agar DRM yoki blok bo'lsa, zaxira variantlardan birini yuklab beramiz
+                # Zaxira variantlar ro'yxatini tuzamiz (SoundCloud variantlariga ustunlik beriladi)
+                alts: list[dict] = []
                 if fallback_candidates:
-                    for alt in fallback_candidates:
-                        if alt["source_id"] == source_id:
-                            continue
-                        try:
-                            async with downloaded_audio(alt["url"]) as (path, info, ext):
-                                await deliver_audio(chat_id, alt, path, info, ext)
-                                return
-                        except Exception:
-                            continue
+                    sc_alts = [c for c in fallback_candidates if c["source_id"].startswith("sc_") and c["source_id"] != source_id]
+                    other_alts = [c for c in fallback_candidates if not c["source_id"].startswith("sc_") and c["source_id"] != source_id]
+                    alts.extend(sc_alts + other_alts)
+
+                # Agar ro'yxatda SoundCloud variantlar bo'lmasa, avtomatik SoundCloud'dan qidirib olamiz
+                if not any(a["source_id"].startswith("sc_") for a in alts):
+                    q = f"{item.get('performer') or ''} {item.get('title') or ''}".strip()
+                    if q:
+                        extra_sc = await run_heavy(_extract_sc_results, clean_search_query(q), 6, set())
+                        alts = extra_sc + alts
+
+                for alt in alts[:6]:
+                    if await send_cached_track(chat_id, alt["source_id"]):
+                        return
+                    try:
+                        async with downloaded_audio(alt["url"]) as (path, info, ext):
+                            await deliver_audio(chat_id, alt, path, info, ext, alias_source_id=source_id)
+                            return
+                    except Exception as alt_err:
+                        log.warning("Zaxira variant ham yuklanmadi (%s): %s", alt["url"], alt_err)
+                        continue
                 raise primary_err
         finally:
             await safe_delete(chat_id, wait_msg.message_id)
@@ -1172,7 +1235,6 @@ async def process_short_video_link(message: Message, item: dict) -> None:
                     media_bytes = f.read()
                 found = await recognize_with_shazam(media_bytes)
 
-            # Agar Shazam topolmasa, videoning o'zini MP3 qilib foydalanuvchiga tashlab beramiz
             if not found:
                 mp3_path, mp3_ext = await ensure_mp3_or_m4a(path, ext)
                 await deliver_audio(chat_id, item, mp3_path, info, mp3_ext)
@@ -1387,7 +1449,6 @@ async def cb_audio_fx(callback: CallbackQuery):
     fx_label, _ = FX_FILTERS[fx_key]
     fx_source_id = f"fx_{fx_key}_{tr['id']}"
 
-    # Agar avval shu effekt tayyorlangan bo'lsa, keshdan yuboramiz
     if await send_cached_track(chat_id, fx_source_id):
         await callback.answer()
         return
@@ -1575,7 +1636,7 @@ async def handle_media_shazam(message: Message):
             await safe_delete(message.chat.id, wait_msg.message_id)
 
         if not found:
-            return await message.answer("😔 Musiqani aniqlab bo'lmadi. Boshqa qismini yuboring yoki nomini yozing.")
+            return await message.answer("😔 Musiqani aniqlab bo'lmadi. Ovozini balandroq qilib boshqa qismini yuboring yoki nomini yozing.")
 
         await message.answer(f"🎶 Topildi: <b>{html.escape(found)}</b>", parse_mode="HTML")
         await process_music_query(message, found)
@@ -1625,10 +1686,10 @@ async def cb_search_play(callback: CallbackQuery):
         results = entry["results"]
         chosen = results[idx]
         try:
-            await send_track_to_user(chat_id, chosen, fallback_candidates=results[:5])
+            await send_track_to_user(chat_id, chosen, fallback_candidates=results)
         except Exception as e:
             log.warning("Variant yuklanmadi: %s", e)
-            await bot.send_message(chat_id, "⚠️ Bu variantni yuklab bo'lmadi (DRM yoki blok). Boshqa raqamni tanlang.")
+            await bot.send_message(chat_id, "⚠️ Bu variantni yuklab bo'lmadi. Boshqa raqamni tanlab ko'ring.")
 
 
 # ==================== MAIN ====================
