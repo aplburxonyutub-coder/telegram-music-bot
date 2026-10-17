@@ -1,10 +1,13 @@
 """
 Telegram musiqa boti (aiogram 3.x) — Railway uchun to'liq moslashtirilgan versiya.
-- 10 talik ro'yxat va sahifalash (⬅️ ❌ ➡️)
-- YouTube Shorts / Reels / TikTok / Voice -> FFmpeg (Loudnorm) -> Shazam -> 10 talik variantlar
-- SoundCloud (Asosiy, bloklanmaydigan) + YouTube qidiruv va Avto-Fallback zanjiri
-- Slowed, Bass, 8D audio effektlar (FFmpeg)
+- 10 talik ro'yxat va sahifalash (⬅️ ❌ ➡️), natijalar bo'ylab uzluksiz raqamlash (11, 12, ...)
+- YouTube Shorts / Reels / TikTok / Voice -> FFmpeg -> Shazam -> 10 talik variantlar
+- Qidiruv tartibi: avval YouTube; u bloklansa yoki kam natija bersa — SoundCloud (avto-fallback)
+- Zaxira faqat AYNAN SHU qo'shiqning boshqa manbadagi nusxasidan olinadi (boshqa qo'shiq yuborilmaydi)
+- Slowed, Bass, 8D audio effektlar (FFmpeg) — ovoz balandligi (LUFS) asl trekka tenglashtiriladi
 - Qo'shiq matni (LRCLIB + Gemini AI), Pleylist (/my), Top (/top), Statistika (/stat)
+
+[TUZATISH] belgisi — kodda aynan nima o'zgartirilganini ko'rsatadi.
 """
 
 import asyncio
@@ -21,6 +24,7 @@ import secrets
 import shutil
 import sqlite3
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -34,7 +38,12 @@ load_dotenv()
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BotCommand,
@@ -78,6 +87,9 @@ HEAVY_COOLDOWN_SEC = 1.0
 MAX_LYRICS_MESSAGES = 4
 FFMPEG_TIMEOUT_SEC = 180
 SUB_CACHE_TTL_SEC = 300
+SEARCH_CACHE_TTL_SEC = 6 * 3600  # [TUZATISH] ro'yxat tugmalari 1 soat o'rniga 6 soat ishlaydi
+YT_COOLDOWN_SEC = 300  # [TUZATISH] YouTube ketma-ket xato bersa, shuncha soniya o'tkazib yuboriladi
+SAME_TRACK_MAX_ALTS = 4  # [TUZATISH] zaxira sifatida sinab ko'riladigan "aynan shu qo'shiq" nusxalari soni
 
 SOCIAL_HOSTS = ("instagram.com", "tiktok.com", "vt.tiktok.com", "vm.tiktok.com")
 MUSIC_HOSTS = ("youtube.com", "youtu.be", "music.youtube.com", "soundcloud.com", "on.soundcloud.com")
@@ -161,11 +173,45 @@ class KeyedLocks:
                 del self._locks[key]
 
 
-search_cache = TTLCache(ttl=3600, max_items=5000)
+class SourceHealth:
+    """[TUZATISH] Manba (YouTube) ketma-ket xato bersa, uni qisqa muddatga o'chirib qo'yadi.
+
+    Shu sababli YouTube bloklaganda har bir so'rov 30-60 soniya kutib qolmaydi:
+    bot darhol keyingi manbaga (SoundCloud) o'tadi. Cooldown tugagach bitta sinov
+    so'rovi o'tkaziladi: muvaffaqiyatli bo'lsa YouTube qayta yoqiladi.
+    """
+
+    def __init__(self, name: str, threshold: int = 2, cooldown: float = YT_COOLDOWN_SEC):
+        self.name = name
+        self.threshold = threshold
+        self.cooldown = cooldown
+        self._fails = 0
+        self._down_until = 0.0
+        self._lock = threading.Lock()
+
+    def available(self) -> bool:
+        return time.monotonic() >= self._down_until
+
+    def ok(self) -> None:
+        with self._lock:
+            self._fails = 0
+            self._down_until = 0.0
+
+    def fail(self) -> None:
+        with self._lock:
+            self._fails += 1
+            if self._fails >= self.threshold:
+                self._down_until = time.monotonic() + self.cooldown
+                log.warning("%s vaqtincha o'chirildi (%d soniya).", self.name, self.cooldown)
+
+
+search_cache = TTLCache(ttl=SEARCH_CACHE_TTL_SEC, max_items=3000)
 sub_ok_cache = TTLCache(ttl=SUB_CACHE_TTL_SEC, max_items=100_000)
 _last_heavy = TTLCache(ttl=120, max_items=100_000)
 _busy_users: set[int] = set()
 keyed_locks = KeyedLocks()
+yt_search_health = SourceHealth("YouTube qidiruvi")
+yt_dl_health = SourceHealth("YouTube yuklash")
 
 
 # ==================== MATN VA VAQT YORDAMCHILARI ====================
@@ -215,15 +261,21 @@ def text_similarity(a: str, b: str) -> float:
 
 
 def split_text(text: str, limit: int = 3600) -> list[str]:
+    """Matnni qatorlar chegarasida bo'laklarga ajratadi.
+    [TUZATISH] Juda uzun qator kesilganda HTML entity (&amp; kabi) o'rtasidan uzilmaydi."""
     parts: list[str] = []
     current = ""
     for line in text.splitlines(keepends=True):
         while len(line) > limit:
+            cut = limit
+            amp = line.rfind("&", 0, limit)
+            if amp > 0 and ";" not in line[amp:limit]:
+                cut = amp
             if current:
                 parts.append(current)
                 current = ""
-            parts.append(line[:limit])
-            line = line[limit:]
+            parts.append(line[:cut])
+            line = line[cut:]
         if len(current) + len(line) > limit:
             parts.append(current)
             current = ""
@@ -354,6 +406,20 @@ def init_db() -> None:
         ensure_column(conn, "users", "gender_prompted", "INTEGER DEFAULT 0")
         ensure_column(conn, "users", "blocked", "INTEGER DEFAULT 0")
         ensure_column(conn, "tracks", "search_text", "TEXT DEFAULT NULL")
+
+        # [TUZATISH] Bir martalik tuzatish. Eski kodda YouTube yuklanmay qolsa, ro'yxatdagi BOSHQA
+        # qo'shiq yuborilib, YouTube ID ostida keshlanib qolardi. Shunday yozuvlarni (source_id 'yt_...',
+        # lekin havolasi SoundCloud) YouTube ID'dan ajratamiz — endi ular noto'g'ri qo'shiq bermaydi.
+        # Yozuvlarning o'zi (pleylist, likelar) o'chirilmaydi.
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version < 1:
+            fixed = conn.execute(
+                "UPDATE tracks SET source_id = 'old_' || source_id "
+                "WHERE source_id LIKE 'yt\\_%' ESCAPE '\\' AND webpage_url LIKE '%soundcloud.com%'"
+            ).rowcount
+            conn.execute("PRAGMA user_version = 1")
+            if fixed:
+                log.info("Eski noto'g'ri keshlar tuzatildi: %s ta", fixed)
 
 
 def register_or_touch_user(user_id: int, inc_search: bool = False) -> sqlite3.Row:
@@ -512,11 +578,41 @@ class AudioTooBig(AudioError):
     pass
 
 
-# ==================== QIDIRUV VA YUKLASH (SOUNDCLOUD + YOUTUBE) ====================
+class SourceBlocked(AudioError):
+    """[TUZATISH] Manba (YouTube) vaqtincha bloklangan — darhol keyingi manbaga o'tiladi."""
+
+
+class DeliveryError(AudioError):
+    """[TUZATISH] Telegramga yuborishda xato — boshqa manbani sinab ko'rishning foydasi yo'q."""
+
+
+# ==================== QIDIRUV VA YUKLASH (YOUTUBE -> SOUNDCLOUD) ====================
 _JUNK_RE = re.compile(
     r"\s*[\(\[](?:official|audio|video|music|lyrics|hd|4k|karaoke|clip|klip|prem\w*).*?[\)\]]",
     re.IGNORECASE,
 )
+
+# [TUZATISH] Xato matnida shular bo'lsa — YouTube bizni bloklayapti (video-xususiy xato emas)
+_BLOCK_HINTS = (
+    "not a bot",
+    "too many requests",
+    "http error 429",
+    "http error 403",
+    "forbidden",
+    "po token",
+    "unable to download webpage",
+    "timed out",
+    "name or service not known",
+    "temporary failure",
+    "connection reset",
+    "connection refused",
+    "network is unreachable",
+)
+
+
+def is_block_error(err: BaseException) -> bool:
+    msg = str(err).lower()
+    return any(h in msg for h in _BLOCK_HINTS)
 
 
 def parse_artist_title(raw_title: str, uploader: str = "") -> tuple[str, str]:
@@ -546,8 +642,10 @@ def build_ydl_opts(use_cookies: bool = True, **extra) -> dict:
 
 
 def _extract_sc_results(query: str, limit: int, seen: set) -> list[dict]:
-    """SoundCloud qidiruvi — Railway'da bloklanmaydi va juda tez ishlaydi."""
+    """SoundCloud qidiruvi — YouTube bloklaganda zaxira manba (Railway'da bloklanmaydi)."""
     results: list[dict] = []
+    if limit <= 0:
+        return results
     sc_opts = build_ydl_opts(use_cookies=False, extract_flat=True, skip_download=True)
     try:
         with yt_dlp.YoutubeDL(sc_opts) as ydl:
@@ -583,57 +681,133 @@ def _extract_sc_results(query: str, limit: int, seen: set) -> list[dict]:
 
 
 def _extract_yt_results(query: str, limit: int, seen: set) -> list[dict]:
-    """YouTube qidiruvi — qo'shimcha natijalar uchun."""
+    """YouTube qidiruvi — ASOSIY manba.
+    [TUZATISH] Xato bo'lsa bo'sh ro'yxat qaytaradi va yt_search_health'ga xabar beradi
+    (ketma-ket 2 xatodan keyin YouTube 5 daqiqaga o'tkazib yuboriladi)."""
     results: list[dict] = []
-    yt_opts = build_ydl_opts(extract_flat="in_playlist", skip_download=True)
+    if limit <= 0:
+        return results
+    yt_opts = build_ydl_opts(extract_flat="in_playlist", skip_download=True, socket_timeout=10, retries=1)
     try:
         with yt_dlp.YoutubeDL(yt_opts) as ydl:
             info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-            for e in ((info or {}).get("entries") or []):
-                if not e:
-                    continue
-                eid = e.get("id")
-                if not eid or eid in seen:
-                    continue
-                dur = int(e.get("duration") or 0)
-                if dur and (dur > MAX_AUDIO_DURATION_SEC or dur < MIN_AUDIO_DURATION_SEC):
-                    continue
-                url = f"https://www.youtube.com/watch?v={eid}"
-                artist, title = parse_artist_title(
-                    e.get("title") or query, e.get("uploader") or e.get("channel") or ""
-                )
-                seen.add(eid)
-                results.append(
-                    {
-                        "source_id": f"yt_{eid}",
-                        "title": title,
-                        "performer": artist,
-                        "duration": dur,
-                        "url": url,
-                    }
-                )
     except Exception as ex:
         log.warning("YouTube qidiruv xatosi: %s", ex)
+        yt_search_health.fail()
+        return results
+
+    entries = (info or {}).get("entries") or []
+    for e in entries:
+        if not e:
+            continue
+        eid = e.get("id")
+        if not eid or eid in seen:
+            continue
+        dur = int(e.get("duration") or 0)
+        if dur and (dur > MAX_AUDIO_DURATION_SEC or dur < MIN_AUDIO_DURATION_SEC):
+            continue
+        url = f"https://www.youtube.com/watch?v={eid}"
+        artist, title = parse_artist_title(e.get("title") or query, e.get("uploader") or e.get("channel") or "")
+        seen.add(eid)
+        results.append(
+            {
+                "source_id": f"yt_{eid}",
+                "title": title,
+                "performer": artist,
+                "duration": dur,
+                "url": url,
+            }
+        )
+    if entries:
+        yt_search_health.ok()
     return results
 
 
+def _dedupe_results(items: list[dict]) -> list[dict]:
+    """[TUZATISH] YouTube va SoundCloud'dagi bir xil qo'shiq ro'yxatda ikki marta chiqmasin."""
+    out: list[dict] = []
+    seen_keys: list[tuple[str, int]] = []
+    for it in items:
+        key = normalize_text(f"{it.get('performer') or ''} {it.get('title') or ''}")
+        dur = int(it.get("duration") or 0)
+        dup = any(k == key and (not dur or not d or abs(dur - d) <= 5) for k, d in seen_keys)
+        if not dup:
+            out.append(it)
+            seen_keys.append((key, dur))
+    return out
+
+
+# ----- [TUZATISH] "Aynan shu qo'shiq" tekshiruvi (zaxira variant tanlash uchun) -----
+_IGNORED_TOKENS = {"ijrochi", "qoshiq", "musiqa", "trek"}
+_VERSION_WORDS = {
+    "remix", "remiks", "cover", "kaver", "kover", "karaoke", "instrumental", "live", "slowed", "reverb",
+    "sped", "nightcore", "8d", "bass", "boosted", "minus", "mashup", "acoustic",
+}
+
+
+def _track_tokens(s: str) -> set[str]:
+    return {t for t in normalize_text(s).split() if t not in _IGNORED_TOKENS}
+
+
+def same_track_score(item: dict, cand: dict) -> float:
+    """cand — item bilan AYNAN BIR XIL qo'shiq ekanini 0..1 oralig'ida baholaydi (0 = boshqa qo'shiq)."""
+    t_item = _track_tokens(item.get("title") or "")
+    p_item = _track_tokens(item.get("performer") or "")
+    c_all = _track_tokens(f"{cand.get('performer') or ''} {cand.get('title') or ''}")
+    if not t_item or not c_all:
+        return 0.0
+
+    di, dc = int(item.get("duration") or 0), int(cand.get("duration") or 0)
+    if di and dc and abs(di - dc) > max(15, 0.12 * max(di, dc)):
+        return 0.0
+    # remix / cover / karaoke kabi versiyalar — boshqa qo'shiq hisoblanadi
+    if (c_all & _VERSION_WORDS) - (t_item | p_item):
+        return 0.0
+
+    title_cov = len(t_item & c_all) / len(t_item)
+    perf_cov = len(p_item & c_all) / len(p_item) if p_item else 1.0
+    if title_cov < 0.75 or perf_cov < 0.5:
+        return 0.0
+    return 0.7 * title_cov + 0.3 * perf_cov
+
+
+def pick_same_track_alts(item: dict, candidates: list[dict], limit: int = SAME_TRACK_MAX_ALTS) -> list[dict]:
+    """Nomzodlar orasidan faqat AYNAN SHU qo'shiqning boshqa nusxalarini tanlaydi.
+    Avval SoundCloud (YouTube bloklangan bo'lishi mumkin), keyin o'xshashlik darajasi bo'yicha."""
+    scored: list[tuple[float, dict]] = []
+    for c in candidates:
+        if c["source_id"] == item["source_id"]:
+            continue
+        s = same_track_score(item, c)
+        if s > 0:
+            scored.append((s, c))
+    scored.sort(key=lambda x: (not x[1]["source_id"].startswith("sc_"), -x[0]))
+    return [c for _, c in scored[:limit]]
+
+
 def search_music_sync(query: str, max_results: int = SEARCH_RESULTS_LIMIT) -> list[dict]:
+    """[TUZATISH] Qidiruv tartibi:
+    1) YouTube (asosiy).
+    2) YouTube xato bergan / bloklangan bo'lsa yoki 1 sahifadan kam natija bersa — SoundCloud bilan to'ldiriladi.
+    3) Agar YouTube'dan YUKLAB bo'lmayotgan bo'lsa (yt_dl_health), SoundCloud natijalari ro'yxat boshiga chiqadi."""
     seen: set = set()
     cleaned = clean_search_query(query) or query
 
-    # 1. Birinchi navbatda SoundCloud'dan qidiramiz (Railway'da 100% bloklanmaydi)
-    results = _extract_sc_results(cleaned, max_results, seen)
+    yt_results: list[dict] = []
+    if yt_search_health.available():
+        yt_results = _extract_yt_results(cleaned, max_results, seen)
 
-    # Agar tozalangan so'rov bo'yicha kam chiqsa va u asl so'rovdan farq qilsa
-    if len(results) < 5 and cleaned != query:
-        results.extend(_extract_sc_results(query, max_results - len(results), seen))
+    yt_download_ok = yt_dl_health.available()
 
-    # 2. Ro'yxatni to'ldirish uchun YouTube natijalarini qo'shamiz
-    if len(results) < max_results:
-        need = max_results - len(results)
-        results.extend(_extract_yt_results(cleaned, need, seen))
+    sc_results: list[dict] = []
+    if len(yt_results) < PLAYLIST_PAGE_SIZE or not yt_download_ok:
+        sc_results = _extract_sc_results(cleaned, max_results, seen)
+        # Tozalangan so'rov bo'yicha kam chiqsa va u asl so'rovdan farq qilsa
+        if len(sc_results) < 5 and cleaned != query:
+            sc_results.extend(_extract_sc_results(query, max_results - len(sc_results), seen))
 
-    return results[:max_results]
+    ordered = (yt_results + sc_results) if yt_download_ok else (sc_results + yt_results)
+    return _dedupe_results(ordered)[:max_results]
 
 
 def _try_download_once(url: str, outdir: str, is_short: bool, use_cookies: bool, client_list: list[str] | None = None) -> tuple[str, dict, str]:
@@ -654,8 +828,27 @@ def _try_download_once(url: str, outdir: str, is_short: bool, use_cookies: bool,
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
         ]
 
+    # [TUZATISH] Havola orqali kelgan juda uzun video/efirlarni yuklab olishdan OLDIN rad etamiz
+    too_long = {"hit": False}
+
+    def _duration_filter(info_dict, *, incomplete=False):
+        try:
+            dur = info_dict.get("duration")
+            if (dur and dur > MAX_AUDIO_DURATION_SEC) or info_dict.get("is_live"):
+                too_long["hit"] = True
+                return "Davomiyligi cheklovdan oshdi"
+        except Exception:
+            pass
+        return None
+
+    if not is_short:
+        opts["match_filter"] = _duration_filter
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
+
+    if too_long["hit"]:
+        raise AudioTooLong(f"Audio {MAX_AUDIO_DURATION_SEC // 60} daqiqadan uzun bo'lmasligi kerak.")
 
     info = info or {}
     if info.get("_type") == "playlist":
@@ -682,6 +875,11 @@ def download_media_sync(url: str, outdir: str, is_short: bool = False) -> tuple[
     if not is_yt:
         return _try_download_once(url, outdir, is_short=is_short, use_cookies=True)
 
+    # [TUZATISH] YouTube yaqinda ketma-ket bloklagan bo'lsa, 3 ta urinishni kutib o'tirmaymiz —
+    # darhol SourceBlocked, shunda bot keyingi manbaga (SoundCloud) o'tadi.
+    if not yt_dl_health.available():
+        raise SourceBlocked("YouTube hozir yuklab bermayapti.")
+
     # YouTube uchun bir nechta usulni ketma-ket sinab ko'ramiz
     attempts = [
         (False, ["android_vr", "ios", "mweb"]),
@@ -689,6 +887,7 @@ def download_media_sync(url: str, outdir: str, is_short: bool = False) -> tuple[
         (False, ["ios", "android", "web"]),
     ]
     last_err = None
+    saw_block = False
     for use_cookies, clients in attempts:
         try:
             for f in os.listdir(outdir):
@@ -696,10 +895,35 @@ def download_media_sync(url: str, outdir: str, is_short: bool = False) -> tuple[
                     os.remove(os.path.join(outdir, f))
                 except OSError:
                     pass
-            return _try_download_once(url, outdir, is_short=is_short, use_cookies=use_cookies, client_list=clients)
+            result = _try_download_once(url, outdir, is_short=is_short, use_cookies=use_cookies, client_list=clients)
+            yt_dl_health.ok()
+            return result
+        except AudioTooLong:
+            raise
         except Exception as e:
             last_err = e
+            saw_block = saw_block or is_block_error(e)
+            log.info("YouTube urinishi bajarilmadi (cookies=%s, clients=%s): %s", use_cookies, clients, e)
+    if saw_block:
+        yt_dl_health.fail()
     raise last_err or AudioError("YouTube orqali yuklab bo'lmadi.")
+
+
+async def run_ffmpeg(args: list[str], timeout: float, want_stderr: bool = False) -> tuple[int, str]:
+    """[TUZATISH] FFmpeg'ni ishga tushiradi. Vaqt tugasa jarayonni o'ldiradi va kutib oladi (zombi qolmaydi).
+    Qaytaradi: (returncode, stderr matni). Timeout bo'lsa returncode = -1."""
+    proc = await asyncio.create_subprocess_exec(
+        FFMPEG_PATH, "-hide_banner", "-nostats", *args,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE if want_stderr else asyncio.subprocess.DEVNULL,
+    )
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return -1, ""
+    return proc.returncode, (err or b"").decode("utf-8", "ignore")
 
 
 async def ensure_mp3_or_m4a(path: str, ext: str) -> tuple[str, str]:
@@ -710,18 +934,12 @@ async def ensure_mp3_or_m4a(path: str, ext: str) -> tuple[str, str]:
 
     out_path = os.path.splitext(path)[0] + "_conv.mp3"
     async with FFMPEG_SEM:
-        proc = await asyncio.create_subprocess_exec(
-            FFMPEG_PATH, "-y", "-i", path, "-vn", "-acodec", "libmp3lame", "-q:a", "4", out_path,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+        rc, _ = await run_ffmpeg(
+            ["-y", "-loglevel", "error", "-i", path, "-vn", "-acodec", "libmp3lame", "-q:a", "4", out_path],
+            timeout=FFMPEG_TIMEOUT_SEC,
         )
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=FFMPEG_TIMEOUT_SEC)
-        except asyncio.TimeoutError:
-            proc.kill()
-            return path, ext
 
-    if os.path.isfile(out_path) and os.path.getsize(out_path) > 1024:
+    if rc == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 1024:
         return out_path, "mp3"
     return path, ext
 
@@ -743,34 +961,69 @@ async def downloaded_audio(url: str, is_short: bool = False):
 
 
 # ==================== AUDIO EFFEKTLAR (SLOWED, BASS, 8D) ====================
+# [TUZATISH] Nima uchun eski effektlarda ovoz past chiqardi (o'lchangan):
+#   - aecho=0.8:0.88 asl signalni 0.8*0.88=0.70 ga (-3 dB) tushiradi            -> slowed  ~ -2.8 dB
+#   - apulsator (amount=1) har bir quloqni 0 gacha so'ndiradi                    -> 8D      ~ -6.6 dB
+#   - bass g=14 pikni +12 dB ga ko'taradi, dynaudnorm esa BUTUN trekni pasaytiradi -> bass    ~ -2.2 dB
+# Endi effektdan keyin ovoz balandligi (LUFS) asl trekka teng qilib to'g'rilanadi (apply_audio_fx).
 FX_FILTERS = {
-    "slowed": ("🌙 Slowed", "asetrate=44100*0.85,aresample=44100,atempo=0.95,aecho=0.8:0.88:60:0.4"),
-    "bass": ("🔥 Bass Boosted", "bass=g=14:f=110:w=0.6,dynaudnorm"),
-    "8d": ("🎧 8D Audio", "apulsator=hz=0.125,aecho=0.8:0.88:40:0.3"),
+    # aresample=44100 birinchi: asetrate faqat 44.1 kHz manbada to'g'ri tezlik beradi (48 kHz'da noto'g'ri edi)
+    "slowed": ("🌙 Slowed", "aresample=44100,asetrate=44100*0.85,aresample=44100,atempo=0.95,aecho=0.8:0.88:60:0.4"),
+    # g=14 -> g=10: haddan tashqari boost pikni oshirib, limiter orqali buzilish beradi
+    "bass": ("🔥 Bass Boosted", "bass=g=10:f=110:w=0.6"),
+    # amount=0.85: quloq to'liq jim bo'lib qolmaydi (effekt saqlanadi, lekin "ovoz o'chib qoldi" degan his yo'qoladi)
+    "8d": ("🎧 8D Audio", "apulsator=hz=0.125:amount=0.85,aecho=0.8:0.88:40:0.3"),
 }
+
+_LOUDNORM_JSON_RE = re.compile(r'\{[^{}]*"input_i"[^{}]*\}', re.S)
+
+
+async def measure_loudness(path: str, af: str = "") -> float | None:
+    """Fayl (ixtiyoriy filtrlar zanjiridan keyin) integral balandligini LUFS'da o'lchaydi."""
+    chain = (af + "," if af else "") + "loudnorm=I=-14:TP=-1.5:LRA=11:print_format=json"
+    rc, err = await run_ffmpeg(["-i", path, "-vn", "-af", chain, "-f", "null", "-"], timeout=120, want_stderr=True)
+    m = _LOUDNORM_JSON_RE.search(err)
+    if rc != 0 or not m:
+        return None
+    try:
+        val = float(json.loads(m.group(0))["input_i"])
+    except (ValueError, KeyError, TypeError):
+        return None
+    return val if math.isfinite(val) and val > -60 else None
 
 
 async def apply_audio_fx(input_path: str, output_path: str, fx_key: str) -> bool:
     if not FFMPEG_PATH or fx_key not in FX_FILTERS:
         return False
-    _, af_filter = FX_FILTERS[fx_key]
+    _, fx_filter = FX_FILTERS[fx_key]
     async with FFMPEG_SEM:
-        proc = await asyncio.create_subprocess_exec(
-            FFMPEG_PATH, "-y", "-i", input_path,
-            "-vn", "-af", af_filter,
-            "-acodec", "libmp3lame", "-b:a", "192k", output_path,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+        # 1) asl trek balandligi, 2) effektdan keyingi balandlik -> farqni gain bilan qoplaymiz
+        src_lufs = await measure_loudness(input_path)
+        fx_lufs = await measure_loudness(input_path, fx_filter) if src_lufs is not None else None
+        if src_lufs is not None and fx_lufs is not None:
+            gain_db = max(-8.0, min(12.0, src_lufs - fx_lufs))
+            log.info("FX %s: asl %.1f LUFS, effektdan keyin %.1f LUFS, gain %+.1f dB", fx_key, src_lufs, fx_lufs, gain_db)
+            # alimiter: pik 0 dBFS dan oshib buzilmasligi uchun; level=0 — limiter o'zi ovozni ko'tarmasin
+            chain = f"{fx_filter},volume={gain_db:.2f}dB,alimiter=limit=0.95:level=0"
+        else:
+            # O'lchab bo'lmasa — standart balandlikka (-12 LUFS) keltiramiz
+            chain = f"{fx_filter},loudnorm=I=-12:TP=-1.0:LRA=11,aresample=44100"
+
+        rc, err = await run_ffmpeg(
+            ["-y", "-loglevel", "error", "-i", input_path, "-vn", "-af", chain,
+             "-ar", "44100", "-acodec", "libmp3lame", "-b:a", "192k", output_path],
+            timeout=FFMPEG_TIMEOUT_SEC,
+            want_stderr=True,
         )
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=FFMPEG_TIMEOUT_SEC)
-        except asyncio.TimeoutError:
-            proc.kill()
-            return False
-    return os.path.isfile(output_path) and os.path.getsize(output_path) > 1024
+        if rc != 0:
+            log.warning("FX FFmpeg xatosi (%s, rc=%s): %s", fx_key, rc, err[-300:])
+    return rc == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 1024
 
 
 # ==================== QO'SHIQ MATNI VA SHAZAM ====================
+AI_LYRICS_NOTE = "⚠️ Bu matn sun'iy intellekt (Gemini) tomonidan yozilgan — xatolar bo'lishi mumkin.\n\n"
+
+
 def fetch_lyrics_sync(performer: str, title: str) -> str | None:
     query = urllib.parse.quote(f"{performer} {title}")
     url = f"https://lrclib.net/api/search?q={query}"
@@ -816,7 +1069,8 @@ async def ai_lyrics(performer: str, title: str) -> str | None:
     text = (res.text or "").strip()
     if not text or "TOPILMADI" in text.upper():
         return None
-    return text
+    # [TUZATISH] Gemini matnni to'qib chiqarishi mumkin — foydalanuvchi buni bilib tursin
+    return AI_LYRICS_NOTE + text
 
 
 async def prepare_wav_for_shazam(raw_bytes: bytes, start_sec: int = 0, duration_sec: int = 14, boost_audio: bool = False) -> bytes:
@@ -829,27 +1083,22 @@ async def prepare_wav_for_shazam(raw_bytes: bytes, start_sec: int = 0, duration_
         with open(in_p, "wb") as f:
             f.write(raw_bytes)
 
-        cmd = [FFMPEG_PATH, "-y"]
+        args = ["-y", "-loglevel", "error"]
         if start_sec > 0:
-            cmd += ["-ss", str(start_sec)]
-        cmd += ["-i", in_p, "-t", str(duration_sec), "-vn"]
+            args += ["-ss", str(start_sec)]
+        args += ["-i", in_p, "-t", str(duration_sec), "-vn"]
         if boost_audio:
-            cmd += [
+            args += [
                 "-af",
                 "silenceremove=start_periods=1:start_silence=0.1:start_threshold=-45dB,"
                 "highpass=f=80,lowpass=f=12000,dynaudnorm=f=100:g=15",
             ]
-        cmd += ["-ac", "1", "-ar", "44100", "-f", "wav", out_p]
+        args += ["-ac", "1", "-ar", "44100", "-f", "wav", out_p]
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=25)
-        except asyncio.TimeoutError:
-            proc.kill()
+        # [TUZATISH] Shazam konvertatsiyasi ham umumiy FFMPEG_SEM bilan cheklanadi (CPU ortiqcha yuklanmasin)
+        async with FFMPEG_SEM:
+            rc, _ = await run_ffmpeg(args, timeout=25)
+        if rc == -1:
             return raw_bytes
 
         if os.path.isfile(out_p) and os.path.getsize(out_p) > 1000:
@@ -940,22 +1189,31 @@ def get_audio_caption(extra: str = "") -> str:
     return f'{prefix}🔊 <a href="https://t.me/{BOT_USERNAME}">Musiqa topish</a>'
 
 
-def get_track_keyboard(track_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="❤️", callback_data=f"fav_add:{track_id}"),
-                InlineKeyboardButton(text="💔", callback_data=f"fav_del:{track_id}"),
-                InlineKeyboardButton(text="🎤 Matn", callback_data=f"lyrics:{track_id}"),
-                InlineKeyboardButton(text="❌", callback_data="delete_msg"),
-            ],
+def get_track_keyboard(track_id: int, show_fx: bool = True) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="❤️", callback_data=f"fav_add:{track_id}"),
+            InlineKeyboardButton(text="💔", callback_data=f"fav_del:{track_id}"),
+            InlineKeyboardButton(text="🎤 Matn", callback_data=f"lyrics:{track_id}"),
+            InlineKeyboardButton(text="❌", callback_data="delete_msg"),
+        ]
+    ]
+    if show_fx:
+        rows.append(
             [
                 InlineKeyboardButton(text="🌙 Slowed", callback_data=f"fx:slowed:{track_id}"),
                 InlineKeyboardButton(text="🔥 Bass", callback_data=f"fx:bass:{track_id}"),
                 InlineKeyboardButton(text="🎧 8D", callback_data=f"fx:8d:{track_id}"),
-            ],
-        ]
-    )
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def track_keyboard_for(row) -> InlineKeyboardMarkup:
+    """[TUZATISH] Effekt qo'yilgan trekka (fx_...) yana effekt tugmalari chiqmaydi:
+    aks holda 'Nom (SLOWED) (SLOWED)' kabi ketma-ket buzilgan versiyalar paydo bo'lardi."""
+    is_fx = str(row["source_id"] or "").startswith("fx_")
+    return get_track_keyboard(row["id"], show_fx=not is_fx)
 
 
 def get_sub_keyboard(not_joined: list[sqlite3.Row]) -> InlineKeyboardMarkup:
@@ -969,10 +1227,13 @@ def build_numbered_keyboard(
     page: int = 0,
     total_items: int = 0,
     page_prefix: str | None = None,
+    start_number: int = 1,
 ) -> InlineKeyboardMarkup:
+    """[TUZATISH] start_number: tugma raqami ro'yxatdagi raqam bilan bir xil bo'lsin
+    (2-sahifada 1..10 emas, 11..20 ko'rinadi)."""
     rows = []
     current_row = []
-    for i, cb in enumerate(item_callbacks, start=1):
+    for i, cb in enumerate(item_callbacks, start=start_number):
         current_row.append(InlineKeyboardButton(text=str(i), callback_data=cb))
         if len(current_row) == 5:
             rows.append(current_row)
@@ -1002,10 +1263,12 @@ async def check_user_subscriptions(user_id: int) -> list[sqlite3.Row]:
     for ch in channels:
         try:
             member = await bot.get_chat_member(chat_id=ch["channel_id"], user_id=user_id)
-            if member.status in ("left", "kicked"):
+            status = getattr(member.status, "value", member.status)
+            if status in ("left", "kicked") or (status == "restricted" and not getattr(member, "is_member", True)):
                 not_joined.append(ch)
-        except Exception:
-            pass
+        except Exception as e:
+            # [TUZATISH] Jimgina yutib yubormaymiz: odatda bot kanalda admin emasligini bildiradi
+            log.warning("Kanalni tekshirib bo'lmadi (%s) — bot kanalga admin qilinganmi? %s", ch["channel_id"], e)
     if not not_joined:
         sub_ok_cache.set(user_id, True)
     return not_joined
@@ -1074,7 +1337,7 @@ async def send_cached_track(chat_id: int, source_id: str) -> bool:
             audio=cached["file_id"],
             caption=get_audio_caption(),
             parse_mode="HTML",
-            reply_markup=get_track_keyboard(cached["id"]),
+            reply_markup=track_keyboard_for(cached),
         )
     except Exception:
         return False
@@ -1088,23 +1351,51 @@ async def deliver_audio(chat_id: int, item: dict, path: str, info: dict, ext: st
         raise AudioTooBig("Fayl hajmi 50 MB dan katta.")
 
     await chat_action(chat_id, "upload_voice")
-    sent = await bot.send_audio(
-        chat_id=chat_id,
-        audio=FSInputFile(path, filename=safe_filename(performer, title, ext)),
-        title=title,
-        performer=performer,
-        duration=dur if dur > 0 else None,
-        caption=get_audio_caption(),
-        parse_mode="HTML",
-    )
-    track_id = await asyncio.to_thread(
-        save_or_update_track, item["source_id"], title, performer, dur, sent.audio.file_id, item["url"]
-    )
-    if alias_source_id and alias_source_id != item["source_id"]:
-        await asyncio.to_thread(
-            save_or_update_track, alias_source_id, title, performer, dur, sent.audio.file_id, item["url"]
+    try:
+        sent = await bot.send_audio(
+            chat_id=chat_id,
+            audio=FSInputFile(path, filename=safe_filename(performer, title, ext)),
+            title=title,
+            performer=performer,
+            duration=dur if dur > 0 else None,
+            caption=get_audio_caption(),
+            parse_mode="HTML",
         )
-    await sent.edit_reply_markup(reply_markup=get_track_keyboard(track_id))
+    except TelegramAPIError as e:
+        log.warning("Telegramga yuborib bo'lmadi: %s", e)
+        raise DeliveryError("Telegramga yuborishda xatolik yuz berdi. Birozdan keyin qayta urinib ko'ring.") from e
+
+    # [TUZATISH] Audio yuborildi. Bundan keyingi xatolar (baza, tugma) endi boshqa manbadan QAYTA yuborishga
+    # olib kelmasligi kerak — aks holda foydalanuvchi bitta so'rovga ikki marta (hatto boshqa) qo'shiq olardi.
+    media = sent.audio or sent.document
+    if media is None:
+        return
+    try:
+        track_id = await asyncio.to_thread(
+            save_or_update_track, item["source_id"], title, performer, dur, media.file_id, item["url"]
+        )
+        if alias_source_id and alias_source_id != item["source_id"]:
+            await asyncio.to_thread(
+                save_or_update_track, alias_source_id, title, performer, dur, media.file_id, item["url"]
+            )
+        await sent.edit_reply_markup(reply_markup=get_track_keyboard(track_id))
+    except Exception as e:
+        log.warning("Trekni saqlash/tugma qo'shishda xato: %s", e)
+
+
+async def search_same_track_elsewhere(item: dict) -> list[dict]:
+    """[TUZATISH] Tanlangan qo'shiqning BOSHQA manbadagi nusxasini qidiradi
+    (YouTube'dan bo'lmasa SoundCloud'da, SoundCloud'dan bo'lmasa YouTube'da)."""
+    q = clean_search_query(f"{item.get('performer') or ''} {item.get('title') or ''}".strip())
+    if not q:
+        return []
+    if item["source_id"].startswith("sc_"):
+        if not (yt_search_health.available() and yt_dl_health.available()):
+            return []
+        found = await run_heavy(_extract_yt_results, q, 6, set())
+    else:
+        found = await run_heavy(_extract_sc_results, q, 6, set())
+    return pick_same_track_alts(item, found)
 
 
 async def send_track_to_user(chat_id: int, item: dict, fallback_candidates: list[dict] | None = None) -> None:
@@ -1121,38 +1412,50 @@ async def send_track_to_user(chat_id: int, item: dict, fallback_candidates: list
                 async with downloaded_audio(item["url"]) as (path, info, ext):
                     await deliver_audio(chat_id, item, path, info, ext)
                     return
+            except (AudioTooLong, AudioTooBig, DeliveryError):
+                raise  # Zaxira manbaning foydasi yo'q: bu qo'shiq uzun/katta yoki Telegram xato berdi
             except Exception as primary_err:
                 log.warning("Asosiy variant yuklanmadi (%s): %s", item["url"], primary_err)
-                # Zaxira variantlar ro'yxatini tuzamiz (SoundCloud variantlariga ustunlik beriladi)
-                alts: list[dict] = []
-                if fallback_candidates:
-                    sc_alts = [c for c in fallback_candidates if c["source_id"].startswith("sc_") and c["source_id"] != source_id]
-                    other_alts = [c for c in fallback_candidates if not c["source_id"].startswith("sc_") and c["source_id"] != source_id]
-                    alts.extend(sc_alts + other_alts)
 
-                # Agar ro'yxatda SoundCloud variantlar bo'lmasa, avtomatik SoundCloud'dan qidirib olamiz
-                if not any(a["source_id"].startswith("sc_") for a in alts):
-                    q = f"{item.get('performer') or ''} {item.get('title') or ''}".strip()
-                    if q:
-                        extra_sc = await run_heavy(_extract_sc_results, clean_search_query(q), 6, set())
-                        alts = extra_sc + alts
+            # [TUZATISH] ZAXIRA: faqat AYNAN SHU qo'shiqning boshqa nusxasi.
+            # Eski kod ro'yxatdagi istalgan boshqa trekni yuborib yuborardi va uni tanlangan
+            # raqam ostida keshlab qo'yardi — shu sababli "boshqa qo'shiq kelyapti" muammosi bo'lgan.
+            alts = pick_same_track_alts(item, fallback_candidates or [])
+            primary_is_sc = source_id.startswith("sc_")
+            if not any(a["source_id"].startswith("sc_") != primary_is_sc for a in alts):
+                alts += await search_same_track_elsewhere(item)
 
-                for alt in alts[:6]:
-                    if await send_cached_track(chat_id, alt["source_id"]):
+            for alt in alts[:SAME_TRACK_MAX_ALTS]:
+                if await send_cached_track(chat_id, alt["source_id"]):
+                    return
+                try:
+                    async with downloaded_audio(alt["url"]) as (path, info, ext):
+                        await deliver_audio(chat_id, alt, path, info, ext, alias_source_id=source_id)
                         return
-                    try:
-                        async with downloaded_audio(alt["url"]) as (path, info, ext):
-                            await deliver_audio(chat_id, alt, path, info, ext, alias_source_id=source_id)
-                            return
-                    except Exception as alt_err:
-                        log.warning("Zaxira variant ham yuklanmadi (%s): %s", alt["url"], alt_err)
-                        continue
-                raise primary_err
+                except (AudioTooLong, AudioTooBig, DeliveryError):
+                    raise
+                except Exception as alt_err:
+                    log.warning("Zaxira variant ham yuklanmadi (%s): %s", alt["url"], alt_err)
+                    continue
+
+            raise AudioError(
+                "Bu qo'shiqni hozir yuklab bo'lmadi (YouTube cheklovi) va uning boshqa manbadagi aynan shu "
+                "nusxasi topilmadi. Boshqa variantni tanlang yoki qo'shiq nomini yozib qidiring."
+            )
         finally:
             await safe_delete(chat_id, wait_msg.message_id)
 
 
 # ==================== RO'YXATLI QIDIRUV ====================
+def source_icon(source_id: str) -> str:
+    sid = source_id or ""
+    if sid.startswith("yt_"):
+        return "🔴"
+    if sid.startswith("sc_"):
+        return "🟠"
+    return "🎵"
+
+
 async def render_search_results(chat_id: int, search_id: str, page: int = 0, edit_message_id: int | None = None) -> None:
     entry = search_cache.get(search_id)
     if not entry:
@@ -1177,12 +1480,21 @@ async def render_search_results(chat_id: int, search_id: str, page: int = 0, edi
     end = start + len(chunk)
 
     lines = [f"🔎 <b>{html.escape(query)}</b>", f"<b>Natijalar {start + 1}-{end} / {total}</b>\n"]
-    for idx, item in enumerate(chunk, start=1):
+    # [TUZATISH] Raqamlar ro'yxat bo'ylab uzluksiz (2-sahifada 11..20), tugmalar ham xuddi shunday raqamlanadi.
+    # Har qator oldidagi belgi manbani ko'rsatadi: 🔴 YouTube, 🟠 SoundCloud.
+    for idx, item in enumerate(chunk, start=start + 1):
         dur_str = format_duration(item.get("duration"))
-        lines.append(f"{idx}. {html.escape(item['performer'] or '')} — {html.escape(item['title'] or '')} <i>{dur_str}</i>")
+        tail = f" <i>{dur_str}</i>" if dur_str else ""
+        lines.append(
+            f"{idx}. {source_icon(item['source_id'])} {html.escape(item['performer'] or '')} — "
+            f"{html.escape(item['title'] or '')}{tail}"
+        )
+    lines.append("\n🔴 YouTube   🟠 SoundCloud")
 
     callbacks = [f"sr:{search_id}:{start + i}" for i in range(len(chunk))]
-    kb = build_numbered_keyboard(callbacks, page=page, total_items=total, page_prefix=f"sr_pg:{search_id}")
+    kb = build_numbered_keyboard(
+        callbacks, page=page, total_items=total, page_prefix=f"sr_pg:{search_id}", start_number=start + 1
+    )
     text = "\n".join(lines)
 
     if edit_message_id:
@@ -1314,10 +1626,14 @@ async def render_playlist_page(chat_id: int, user_id: int, page: int = 0, edit_m
     chunk = favs[start : start + PLAYLIST_PAGE_SIZE]
 
     lines = [f"❤️ <b>Pleylistingiz</b> ({page + 1}/{last_page + 1}):\n"]
-    for idx, tr in enumerate(chunk, start=1):
+    for idx, tr in enumerate(chunk, start=start + 1):  # [TUZATISH] uzluksiz raqamlash
         lines.append(f"{idx}. {html.escape(tr['performer'] or '')} — {html.escape(tr['title'] or '')}")
     kb = build_numbered_keyboard(
-        [f"play:{tr['id']}" for tr in chunk], page=page, total_items=len(favs), page_prefix="my_page"
+        [f"play:{tr['id']}" for tr in chunk],
+        page=page,
+        total_items=len(favs),
+        page_prefix="my_page",
+        start_number=start + 1,
     )
     text = "\n".join(lines)
     if edit_message_id:
@@ -1359,7 +1675,7 @@ async def cb_play_track(callback: CallbackQuery):
             audio=tr["file_id"],
             caption=get_audio_caption(),
             parse_mode="HTML",
-            reply_markup=get_track_keyboard(tr["id"]),
+            reply_markup=track_keyboard_for(tr),
         )
     except Exception:
         pass
@@ -1416,12 +1732,19 @@ async def cb_lyrics(callback: CallbackQuery):
         return
 
     header = f"🎤 <b>{html.escape(tr['performer'] or '')} — {html.escape(tr['title'] or '')}</b>\n\n"
-    chunks = split_text(lyrics, 3500)[:MAX_LYRICS_MESSAGES]
+    # [TUZATISH] AVVAL HTML'ni escape qilamiz, KEYIN bo'laklaymiz. Eski kodda bo'lak escape'dan oldin kesilardi:
+    # o'zbekcha matndagi har bir ' belgisi &#x27; (6 belgi) ga aylanib, xabar 4096 limitdan oshib ketar va
+    # matn umuman yuborilmasdi. quote=False bilan esa apostrof joyida qoladi.
+    body = html.escape(lyrics, quote=False)
+    chunks = split_text(body, 3500)
+    truncated = len(chunks) > MAX_LYRICS_MESSAGES
+    chunks = chunks[:MAX_LYRICS_MESSAGES]
     for i, part in enumerate(chunks):
         prefix = header if i == 0 else ""
+        suffix = "\n…" if (truncated and i == len(chunks) - 1) else ""
         await bot.send_message(
             chat_id,
-            f"{prefix}{html.escape(part)}",
+            f"{prefix}{part}{suffix}",
             parse_mode="HTML",
             reply_markup=CLOSE_KB if i == len(chunks) - 1 else None,
         )
@@ -1445,6 +1768,9 @@ async def cb_audio_fx(callback: CallbackQuery):
     tr = await asyncio.to_thread(get_track_by_id, track_id)
     if not tr or not tr["file_id"] or chat_id is None:
         return await callback.answer("Audio topilmadi", show_alert=True)
+    # [TUZATISH] Effekt qo'yilgan trekka (eski xabarlardagi tugmalar orqali) yana effekt qo'yilmaydi
+    if str(tr["source_id"] or "").startswith("fx_"):
+        return await callback.answer("Bu trekda effekt allaqachon bor. Asl trekdan foydalaning.", show_alert=True)
 
     fx_label, _ = FX_FILTERS[fx_key]
     fx_source_id = f"fx_{fx_key}_{tr['id']}"
@@ -1492,7 +1818,7 @@ async def cb_audio_fx(callback: CallbackQuery):
                     sent.audio.file_id,
                     tr["webpage_url"] or "",
                 )
-                await sent.edit_reply_markup(reply_markup=get_track_keyboard(new_id))
+                await sent.edit_reply_markup(reply_markup=get_track_keyboard(new_id, show_fx=False))
         except Exception as e:
             log.warning("FX xatosi: %s", e)
             await bot.send_message(chat_id, "⚠️ Fayl hajmi katta yoki xatolik yuz berdi.")
@@ -1605,6 +1931,9 @@ async def cmd_set_cookies(message: Message):
     os.makedirs(os.path.dirname(target), exist_ok=True)
     tg_file = await bot.get_file(message.document.file_id)
     await bot.download_file(tg_file.file_path, destination=target)
+    # [TUZATISH] Yangi cookies qo'yildi — YouTube'ni qayta sinab ko'rish uchun "o'chirilgan" holatni tozalaymiz
+    yt_search_health.ok()
+    yt_dl_health.ok()
     await message.answer(f"✅ Cookies saqlandi: {target}")
     await safe_delete(message.chat.id, message.message_id)
 
@@ -1687,6 +2016,9 @@ async def cb_search_play(callback: CallbackQuery):
         chosen = results[idx]
         try:
             await send_track_to_user(chat_id, chosen, fallback_candidates=results)
+        except AudioError as e:
+            # [TUZATISH] Aniq sabab ko'rsatiladi (masalan, "aynan shu qo'shiqning boshqa nusxasi topilmadi")
+            await bot.send_message(chat_id, f"⚠️ {e}")
         except Exception as e:
             log.warning("Variant yuklanmadi: %s", e)
             await bot.send_message(chat_id, "⚠️ Bu variantni yuklab bo'lmadi. Boshqa raqamni tanlab ko'ring.")
